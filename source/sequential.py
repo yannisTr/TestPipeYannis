@@ -12,7 +12,102 @@ import aiohttp
 import os
 from fastapi import HTTPException
 
+import asyncio
+import threading
+import weakref
+from contextlib import asynccontextmanager
+from threading import Lock
+from typing import Optional, ClassVar, Dict, List, Union, Any
+
 class Pipeline:
+    _instance: ClassVar[Optional['Pipeline']] = None
+    _instances: ClassVar[Dict[int, 'Pipeline']] = weakref.WeakValueDictionary()
+    _lock = Lock()
+    _session_lock = Lock()
+    
+    @classmethod
+    async def get_instance(cls):
+        """Get or create a Pipeline instance (for FastAPI dependency injection)"""
+        task_id = id(asyncio.current_task())
+        with cls._lock:
+            instance = cls._instances.get(task_id)
+            if instance is None or not instance.is_initialized:
+                instance = cls()
+                await instance.on_startup()
+                cls._instances[task_id] = instance
+            elif instance._session and instance._session.closed:
+                await instance.on_startup()
+            return instance
+
+    @classmethod
+    def get_sync_instance(cls):
+        """Synchronous version of get_instance for non-async contexts"""
+        thread_id = id(threading.current_thread())
+        with cls._lock:
+            instance = cls._instances.get(thread_id)
+            if instance is None or not instance.is_initialized:
+                instance = cls()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(instance.on_startup())
+                else:
+                    loop.run_until_complete(instance.on_startup())
+                cls._instances[thread_id] = instance
+            elif instance._session and instance._session.closed:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(instance.on_startup())
+                else:
+                    loop.run_until_complete(instance.on_startup())
+            return instance
+
+    @classmethod
+    @asynccontextmanager
+    async def create(cls):
+        """Factory method to properly initialize Pipeline with async context"""
+        pipeline = cls()
+        await pipeline.on_startup()
+        try:
+            yield pipeline
+        finally:
+            await pipeline.on_shutdown()
+
+    def __del__(self):
+        """Ensure cleanup of resources"""
+        try:
+            # Clean up session
+            if self._session:
+                try:
+                    loop = asyncio.get_running_loop()
+                    if not loop.is_closed():
+                        loop.create_task(self.on_shutdown())
+                except RuntimeError:
+                    # No running event loop
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(self.on_shutdown())
+                    finally:
+                        loop.close()
+                        asyncio.set_event_loop(None)
+            
+            # Clean up instance tracking
+            task_id = None
+            try:
+                task_id = id(asyncio.current_task())
+            except RuntimeError:
+                thread_id = id(threading.current_thread())
+                if thread_id in self._instances:
+                    del self._instances[thread_id]
+            
+            if task_id and task_id in self._instances:
+                del self._instances[task_id]
+                
+        except Exception as e:
+            # Log but don't raise during cleanup
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error during cleanup: {str(e)}")
+
     class Valves(BaseModel):
         max_steps: int = Field(
             default=5,
@@ -47,12 +142,18 @@ class Pipeline:
         self.name = "Sequential Thinking Pipeline"
         self.valves = self.Valves()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._initialized = False
         self.logger = self._setup_logger()
         self.thinking_prompt = """As an AI assistant, follow these steps for sequential thinking:
 1. Initial Analysis
 2. Step-by-Step Reasoning
 3. Solution Development
 4. Verification & Conclusion"""
+        
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized and self._session is not None
+
 
     def _setup_logger(self):
         logger = logging.getLogger(__name__)
@@ -72,7 +173,9 @@ class Pipeline:
         self.logger.info(f"Starting {self.name}")
         if not self.valves.openai_api_key:
             self.logger.warning("OpenAI API key not set!")
-        self._session = aiohttp.ClientSession()
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+        self._initialized = True
 
     async def on_shutdown(self):
         self.logger.info(f"Shutting down {self.name}")
@@ -80,7 +183,16 @@ class Pipeline:
             await self._session.close()
 
     async def pipe(self, user_message: Optional[str] = None, messages: Optional[List[Dict]] = None, body: Optional[Dict] = None, **kwargs) -> Union[str, Dict]:
-        """Main pipeline processing method"""
+        """
+        Main pipeline processing method - must be used in async context
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Pipeline not properly initialized. Use 'async with Pipeline.create()' to create a pipeline instance.")
+            
+        # Ensure session is available
+        with self._session_lock:
+            if not self._session or self._session.closed:
+                self._session = aiohttp.ClientSession()
         try:
             # Handle title generation request
             if body and body.get("title", False):
@@ -117,8 +229,9 @@ class Pipeline:
         if not message:
             return "No message provided"
 
-        if not self._session:
-            self._session = aiohttp.ClientSession()
+        with self._session_lock:
+            if not self._session:
+                self._session = aiohttp.ClientSession()
 
         headers = {
             "Authorization": f"Bearer {self.valves.openai_api_key}",
@@ -154,10 +267,18 @@ class Pipeline:
             self.logger.error(f"Error processing message: {str(e)}")
             raise
 
-    def filter_inlet(self, messages: List[dict], body: Dict) -> tuple[List[dict], Dict]:
+    async def filter_inlet(self, messages: List[dict], body: Dict) -> tuple[List[dict], Dict]:
         """Pre-process messages and body before pipeline execution"""
+        # Ensure session is available for subsequent operations
+        with self._session_lock:
+            if not self._session or self._session.closed:
+                self._session = aiohttp.ClientSession()
         return messages, body
 
-    def filter_outlet(self, response: Any) -> Any:
+    async def filter_outlet(self, response: Any) -> Any:
         """Post-process pipeline response"""
+        # Check session state after processing
+        if self._session and self._session.closed:
+            with self._session_lock:
+                self._session = aiohttp.ClientSession()
         return response
