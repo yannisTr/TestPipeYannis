@@ -6,7 +6,6 @@ description: A pipeline for enhancing LLM reasoning through structured sequentia
 """
 
 import logging
-import asyncio
 from typing import Dict, List, Optional, Union, Any
 from pydantic import BaseModel, Field
 import aiohttp
@@ -16,7 +15,7 @@ from fastapi import HTTPException
 class Pipeline:
     class Valves(BaseModel):
         max_steps: int = Field(
-            default=5,
+            default=6,
             description="Maximum number of thinking steps"
         )
         depth_level: str = Field(
@@ -80,24 +79,11 @@ class Pipeline:
         if self._session:
             await self._session.close()
 
-    def pipe(self, messages: List[Dict], body: Dict) -> str:
-        """Synchronous wrapper for async pipeline processing"""
+    async def pipe(self, messages: List[Dict], body: Dict) -> Union[str, Dict]:
+        """Main pipeline processing method"""
         if body.get("title", False):
             return self.name
 
-        # Create a task in the event loop to process the message
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(self._async_process(messages, body))
-        
-        try:
-            # Wait for the task to complete with a timeout
-            return loop.run_until_complete(task)
-        except Exception as e:
-            self.logger.error(f"Error in pipeline: {str(e)}")
-            raise
-
-    async def _async_process(self, messages: List[Dict], body: Dict) -> str:
-        """Asynchronous processing of messages"""
         try:
             # Get the model from body or use default
             model = body.get("model", self.valves.model)
@@ -112,7 +98,7 @@ class Pipeline:
             return await self._process_message(user_message, model, system_message)
 
         except Exception as e:
-            self.logger.error(f"Error in async processing: {str(e)}")
+            self.logger.error(f"Error in pipeline: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
     async def _process_message(self, message: str, model: str, system_message: Optional[str] = None) -> str:
@@ -157,7 +143,7 @@ class Pipeline:
             self.logger.error(f"Error processing message: {str(e)}")
             raise
 
-    def filter_inlet(self, messages: List[Dict], body: Dict) -> tuple[List[Dict], Dict]:
+    def filter_inlet(self, messages: List[dict], body: Dict) -> tuple[List[dict], Dict]:
         """Pre-process messages and body before pipeline execution"""
         return messages, body
 
