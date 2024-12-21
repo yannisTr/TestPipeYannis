@@ -6,12 +6,11 @@ description: A pipeline for enhancing LLM reasoning through structured sequentia
 """
 
 import logging
-import json
-from typing import Generator, Iterator, List, Union, Optional, Any
+from typing import Dict, List, Optional, Union, Any
 from pydantic import BaseModel, Field
 import aiohttp
 import os
-import asyncio
+from fastapi import HTTPException
 
 class Pipeline:
     class Valves(BaseModel):
@@ -47,10 +46,14 @@ class Pipeline:
     def __init__(self):
         self.name = "Sequential Thinking Pipeline"
         self.valves = self.Valves()
-        self.thinking_prompt = self._get_thinking_prompt()
-        self.logger = self._setup_logger()
         self._session: Optional[aiohttp.ClientSession] = None
-        
+        self.logger = self._setup_logger()
+        self.thinking_prompt = """As an AI assistant, follow these steps for sequential thinking:
+1. Initial Analysis
+2. Step-by-Step Reasoning
+3. Solution Development
+4. Verification & Conclusion"""
+
     def _setup_logger(self):
         logger = logging.getLogger(__name__)
         if not logger.handlers:
@@ -65,32 +68,6 @@ class Pipeline:
             logger.propagate = False
         return logger
 
-    def _get_thinking_prompt(self):
-        return """As an AI assistant, follow these steps for sequential thinking:
-
-1. Initial Analysis
-- Understand the core question/task
-- Identify key components and constraints
-- Map known and unknown elements
-
-2. Step-by-Step Reasoning
-- Break down complex problems into smaller parts
-- Show your work clearly for each step
-- Identify and state any assumptions made
-- Note potential limitations or edge cases
-
-3. Solution Development
-- Build progressively on previous steps
-- Consider multiple approaches when relevant
-- Verify each step's logic
-- Be explicit about your reasoning process
-
-4. Verification & Conclusion
-- Review the complete reasoning chain
-- Validate assumptions and conclusions
-- Present final answer clearly
-- Note any remaining uncertainties"""
-
     async def on_startup(self):
         self.logger.info(f"Starting {self.name}")
         if not self.valves.openai_api_key:
@@ -102,37 +79,69 @@ class Pipeline:
         if self._session:
             await self._session.close()
 
-    def _prepare_messages(self, user_message: str, system_message: Optional[str] = None) -> List[dict]:
+    async def pipe(self, user_message: Optional[str] = None, messages: Optional[List[Dict]] = None, body: Optional[Dict] = None, **kwargs) -> Union[str, Dict]:
+        """Main pipeline processing method"""
+        try:
+            # Handle title generation request
+            if body and body.get("title", False):
+                return self.name
+
+            # Get messages from either direct parameter or body
+            if messages is None and body:
+                messages = body.get("messages", [])
+
+            # Get model from body or use default
+            model = body.get("model", self.valves.model) if body else self.valves.model
+
+            # Get the actual user message
+            actual_message = user_message
+            if not actual_message and messages:
+                actual_message = messages[-1].get("content", "") if messages else ""
+
+            # Get system message if present
+            system_message = None
+            if messages and messages[0].get("role") == "system":
+                system_message = messages[0].get("content")
+
+            # Process the message
+            response = await self._process_message(actual_message, model, system_message)
+            
+            return response
+
+        except Exception as e:
+            self.logger.error(f"Error in pipeline: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def _process_message(self, message: str, model: str, system_message: Optional[str] = None) -> str:
+        """Process a single message through the pipeline"""
+        if not message:
+            return "No message provided"
+
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+
+        headers = {
+            "Authorization": f"Bearer {self.valves.openai_api_key}",
+            "Content-Type": "application/json"
+        }
+
         messages = []
-        
         if system_message:
             messages.append({"role": "system", "content": system_message})
         else:
             messages.append({"role": "system", "content": self.thinking_prompt})
 
-        messages.append({"role": "user", "content": user_message})
-        return messages
-
-    async def _process_with_openai(self, messages: List[dict], model: Optional[str] = None) -> str:
-        if not self._session:
-            self._session = aiohttp.ClientSession()
-            
-        headers = {
-            "Authorization": f"Bearer {self.valves.openai_api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": model or self.valves.model,
-            "messages": messages,
-            "temperature": self.valves.temperature
-        }
+        messages.append({"role": "user", "content": message})
 
         try:
             async with self._session.post(
                 f"{self.valves.openai_api_base}/chat/completions",
                 headers=headers,
-                json=data
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": self.valves.temperature
+                }
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -140,68 +149,15 @@ class Pipeline:
                 
                 result = await response.json()
                 return result["choices"][0]["message"]["content"]
+
         except Exception as e:
-            self.logger.error(f"Error in OpenAI request: {str(e)}")
+            self.logger.error(f"Error processing message: {str(e)}")
             raise
 
-    def filter_inlet(self, messages: List[dict], body: dict) -> tuple[List[dict], dict]:
+    def filter_inlet(self, messages: List[dict], body: Dict) -> tuple[List[dict], Dict]:
+        """Pre-process messages and body before pipeline execution"""
         return messages, body
 
     def filter_outlet(self, response: Any) -> Any:
+        """Post-process pipeline response"""
         return response
-
-    async def pipe(self, messages: List[dict], body: dict) -> Union[str, dict]:
-        """Main pipeline processing method"""
-        try:
-            if body.get("title", False):
-                return self.name
-
-            user_message = messages[-1]["content"] if messages else ""
-            model_id = body.get("model", self.valves.model)
-            
-            # Extract system message if present
-            system_message = None
-            if messages and messages[0].get("role") == "system":
-                system_message = messages[0]["content"]
-
-            # Prepare messages
-            processed_messages = self._prepare_messages(user_message, system_message)
-            
-            # Process with OpenAI
-            self.logger.debug(f"Processing request with model: {model_id}")
-            response = await self._process_with_openai(processed_messages, model_id)
-
-            if self.valves.structured_output:
-                return response
-
-            return response
-
-        except Exception as e:
-            self.logger.error(f"Error in pipeline: {str(e)}")
-            raise
-
-    def _verify_response(self, response: str) -> bool:
-        required_sections = [
-            "Initial Analysis",
-            "Step-by-Step Reasoning",
-            "Solution Development",
-            "Verification & Conclusion"
-        ]
-        return all(section.lower() in response.lower() for section in required_sections)
-
-    async def _retry_with_clarification(self, messages: List[dict], model: str, attempt: int = 1) -> str:
-        if attempt > 3:
-            raise Exception("Failed to get a properly structured response after 3 attempts")
-
-        clarification = (
-            "Please ensure your response follows the sequential thinking structure "
-            "with all four sections clearly labeled."
-        )
-        
-        messages.append({"role": "user", "content": clarification})
-        response = await self._process_with_openai(messages, model)
-        
-        if self._verify_response(response):
-            return response
-            
-        return await self._retry_with_clarification(messages, model, attempt + 1)
