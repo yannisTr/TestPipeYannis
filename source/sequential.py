@@ -1,152 +1,151 @@
 """
 title: Sequential Thinking Pipeline
-author: YannisTr
-version: 1.0
-description: A pipeline for enhancing LLM reasoning through structured sequential thinking
+author: Yannis
+repo: https://github.com/Yannis/sequential-thinking-pipeline
+version: 1.1
+information: Pipeline avancé pour réflexion séquentielle dynamique dans Open WebUI.
 """
 
 import logging
-from typing import Dict, List, Optional, Union, Any
-from pydantic import BaseModel, Field
-import aiohttp
-import os
-from fastapi import HTTPException
+from typing import Generator, Iterator, Optional
 
-class Pipeline:
+from open_webui.apps.openai import main as openai
+from open_webui.constants import TASKS
+from open_webui.utils.misc import (
+    add_or_update_system_message,
+    get_system_message,
+    pop_system_message
+)
+from pydantic import BaseModel
+
+# Nom du pipeline
+name = "SequentialThinking"
+
+# Initialisation du logger
+def setup_logger():
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.setLevel(logging.DEBUG)
+        handler = logging.StreamHandler()
+        handler.set_name(name)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.propagate = False
+    return logger
+
+logger = setup_logger()
+
+class SequentialThinkingPipe:
+    """Classe principale du pipeline"""
+
     class Valves(BaseModel):
-        max_steps: int = Field(
-            default=6,
-            description="Maximum number of thinking steps"
-        )
-        depth_level: str = Field(
-            default="detailed",
-            description="Depth of reasoning (basic/detailed/comprehensive)"
-        )
-        structured_output: bool = Field(
-            default=True,
-            description="Whether to format output in structured steps"
-        )
-        openai_api_key: str = Field(
-            default=os.getenv("OPENAI_API_KEY", ""),
-            description="OpenAI API Key for completions"
-        )
-        openai_api_base: str = Field(
-            default="https://api.openai.com/v1",
-            description="OpenAI API Base URL"
-        )
-        model: str = Field(
-            default="gpt-3.5-turbo",
-            description="Default model to use"
-        )
-        temperature: float = Field(
-            default=0.7,
-            description="Temperature for completions"
-        )
+        """Configurations dynamiques du pipeline (si besoin)."""
+        reflection_mode: Optional[str] = "auto"  # "auto", "manual", or "off"
 
     def __init__(self):
-        self.name = "Sequential Thinking Pipeline"
         self.valves = self.Valves()
-        self._session: Optional[aiohttp.ClientSession] = None
-        self.logger = self._setup_logger()
-        self.thinking_prompt = """As an AI assistant, follow these steps for sequential thinking:
-1. Initial Analysis
-2. Step-by-Step Reasoning
-3. Solution Development
-4. Verification & Conclusion"""
 
-    def _setup_logger(self):
-        logger = logging.getLogger(__name__)
-        if not logger.handlers:
-            logger.setLevel(logging.DEBUG)
-            handler = logging.StreamHandler()
-            handler.set_name(self.name)
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    def pipes(self) -> list[dict[str, str]]:
+        """Récupère la liste des modèles disponibles."""
+        openai.get_all_models()
+        models = openai.app.state.MODELS
+
+        return [
+            {"id": f"{name}-{key}", "name": f"{name} {models[key]['name']}"}
+            for key in models
+        ]
+
+    def get_thinking_prompt(self):
+        """Prompt pour activer la réflexion séquentielle."""
+        return """<sequential_thinking_protocol>
+Claude suit un protocole de réflexion avancée :
+1. Décompose chaque requête en étapes.
+2. Génère plusieurs hypothèses ou solutions.
+3. Révise son raisonnement à chaque étape.
+4. Explore des alternatives tout en restant centré sur le problème principal.
+5. Formule une réponse claire et structurée après réflexion complète.
+
+Tous les détails de réflexion seront encapsulés dans un bloc `thinking` invisible pour l'utilisateur.
+</sequential_thinking_protocol>"""
+
+    def should_initiate_thinking(self, messages: list[dict]) -> bool:
+        """Détermine si la réflexion séquentielle doit être activée."""
+        user_message = messages[-1]["content"].lower()
+        return "think:" in user_message or self.valves.reflection_mode == "auto"
+
+    def adapt_thinking(self, thinking_block: str, new_message: str) -> str:
+        """Adapte le raisonnement en fonction des nouveaux messages."""
+        return (
+            f"{thinking_block}\n\n--- Mise à jour : "
+            f"Considérez également cette nouvelle requête : {new_message}."
+        )
+
+    def add_branch(self, thinking_block: str, branch_idea: str) -> str:
+        """Ajoute une branche alternative au raisonnement."""
+        return f"{thinking_block}\n\n--- Exploration alternative : {branch_idea} ---"
+
+    def resolve_model(self, body: dict) -> str:
+        """Récupère le modèle spécifique à utiliser."""
+        model_id = body.get("model")
+        without_pipe = ".".join(model_id.split(".")[1:])
+        return without_pipe.replace(f"{name}-", "")
+
+    async def get_completion(self, model: str, messages: list):
+        """Récupère une réponse du modèle."""
+        response = await openai.generate_chat_completion(
+            {"model": model, "messages": messages, "stream": False}
+        )
+        return self.get_response_content(response)
+
+    def get_response_content(self, response: dict) -> str:
+        """Extrait le contenu principal de la réponse."""
+        try:
+            return response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError):
+            logger.error(
+                f"ResponseError: Unable to extract content from response: {response}"
             )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-            logger.propagate = False
-        return logger
+            return ""
 
-    async def on_startup(self):
-        self.logger.info(f"Starting {self.name}")
-        if not self.valves.openai_api_key:
-            self.logger.warning("OpenAI API key not set!")
-        self._session = aiohttp.ClientSession()
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict,
+        __event_emitter__=None,
+        __task__=None,
+        __model__=None,
+    ) -> str | Generator | Iterator:
+        """Pipeline principal."""
+        model = self.resolve_model(body)
+        body["model"] = model
+        system_message = get_system_message(body["messages"])
 
-    async def on_shutdown(self):
-        self.logger.info(f"Shutting down {self.name}")
-        if self._session:
-            await self._session.close()
+        # Activation de la réflexion séquentielle si nécessaire
+        if self.should_initiate_thinking(body["messages"]):
+            thinking_protocol = self.get_thinking_prompt()
+            system_message, body["messages"] = pop_system_message(body["messages"])
+            system_message = f"{thinking_protocol}\n\n{system_message['content']}"
+            body["messages"] = add_or_update_system_message(system_message, body["messages"])
+            logger.debug("Réflexion séquentielle activée.")
 
-    async def pipe(self, messages: List[Dict], body: Dict) -> Union[str, Dict]:
-        """Main pipeline processing method"""
-        if body.get("title", False):
-            return self.name
+        current_thinking = get_system_message(body["messages"])["content"]
+        if __task__ == TASKS.TITLE_GENERATION:
+            content = await self.get_completion(model, body.get("messages"))
+            return f"{name}: {content}"
 
-        try:
-            # Get the model from body or use default
-            model = body.get("model", self.valves.model)
+        # Mise à jour dynamique du raisonnement
+        if len(body["messages"]) > 1:
+            new_message = body["messages"][-1]["content"]
+            current_thinking = self.adapt_thinking(current_thinking, new_message)
+            body["messages"] = add_or_update_system_message(current_thinking, body["messages"])
 
-            # Get the actual message
-            user_message = messages[-1].get("content", "") if messages else ""
+        # Ajout d'une exploration alternative
+        branch_idea = "Réfléchissez à un contre-exemple ou à une approche différente."
+        current_thinking = self.add_branch(current_thinking, branch_idea)
+        body["messages"] = add_or_update_system_message(current_thinking, body["messages"])
 
-            # Get system message if present
-            system_message = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
-
-            # Process the message
-            return await self._process_message(user_message, model, system_message)
-
-        except Exception as e:
-            self.logger.error(f"Error in pipeline: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    async def _process_message(self, message: str, model: str, system_message: Optional[str] = None) -> str:
-        """Process a single message through the OpenAI API"""
-        if not message:
-            return "No message provided"
-
-        if not self._session:
-            self._session = aiohttp.ClientSession()
-
-        headers = {
-            "Authorization": f"Bearer {self.valves.openai_api_key}",
-            "Content-Type": "application/json"
-        }
-
-        messages = []
-        if system_message:
-            messages.append({"role": "system", "content": system_message})
-        else:
-            messages.append({"role": "system", "content": self.thinking_prompt})
-
-        messages.append({"role": "user", "content": message})
-
-        try:
-            async with self._session.post(
-                f"{self.valves.openai_api_base}/chat/completions",
-                headers=headers,
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": self.valves.temperature
-                }
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise Exception(f"OpenAI API error: {error_text}")
-                
-                result = await response.json()
-                return result["choices"][0]["message"]["content"]
-
-        except Exception as e:
-            self.logger.error(f"Error processing message: {str(e)}")
-            raise
-
-    def filter_inlet(self, messages: List[dict], body: Dict) -> tuple[List[dict], Dict]:
-        """Pre-process messages and body before pipeline execution"""
-        return messages, body
-
-    def filter_outlet(self, response: Any) -> Any:
-        """Post-process pipeline response"""
-        return response
+        # Génération finale
+        return await openai.generate_chat_completion(body, user=__user__)
