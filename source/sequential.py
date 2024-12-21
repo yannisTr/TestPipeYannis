@@ -16,8 +16,8 @@ from starlette.concurrency import run_in_threadpool
 class Pipeline:
     class Valves(BaseModel):
         max_steps: int = Field(
-            default=5,
-            description="Maximum number of thinking steps"
+            default=6,
+            description="Maximum number of thinking step"
         )
         depth_level: str = Field(
             default="detailed",
