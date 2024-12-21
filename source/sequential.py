@@ -1,6 +1,6 @@
 """
 title: Sequential Thinking Pipeline
-author: [Votre nom]
+author: YannisTr
 version: 1.0
 description: A pipeline for enhancing LLM reasoning through structured sequential thinking
 """
@@ -8,15 +8,21 @@ description: A pipeline for enhancing LLM reasoning through structured sequentia
 import logging
 from typing import Generator, Iterator
 from pydantic import BaseModel, Field
+from open_webui.apps.openai import main as openai
+from open_webui.constants import TASKS
+from open_webui.utils.misc import add_or_update_system_message, get_system_message, pop_system_message
 
-# Configuration du logger
+name = "Sequential"
+
 def setup_logger():
     logger = logging.getLogger(__name__)
     if not logger.handlers:
         logger.setLevel(logging.DEBUG)
         handler = logging.StreamHandler()
-        handler.set_name("sequential_thinking")
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        handler.set_name(name)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
         logger.propagate = False
@@ -24,7 +30,7 @@ def setup_logger():
 
 logger = setup_logger()
 
-class Pipe:
+class Pipeline:
     class Valves(BaseModel):
         max_steps: int = Field(
             default=5,
@@ -52,77 +58,94 @@ class Pipe:
 - Map known and unknown elements
 
 2. Step-by-Step Reasoning
-- Break down complex problems
-- Show your work clearly
-- Identify assumptions and limitations
+- Break down complex problems into smaller parts
+- Show your work clearly for each step
+- Identify and state any assumptions made
+- Note potential limitations or edge cases
 
 3. Solution Development
-- Build on previous steps
-- Consider alternatives
-- Verify conclusions
+- Build progressively on previous steps
+- Consider multiple approaches when relevant
+- Verify each step's logic
+- Be explicit about your reasoning process
 
-4. Output Formatting
-- Present conclusions clearly
-- Summarize key points
-- Note any uncertainties
+4. Verification & Conclusion
+- Review the complete reasoning chain
+- Validate assumptions and conclusions
+- Present final answer clearly
+- Note any remaining uncertainties
 
-Follow this process for every response, showing your work at each step."""
+Maintain this structured approach for each response, documenting your thought process throughout."""
 
     def resolve_model(self, body: dict) -> str:
         model_id = body.get("model")
-        return model_id.split("sequential_thinking-")[-1]
+        without_pipe = ".".join(model_id.split(".")[1:])
+        return without_pipe.replace(f"{name}-", "")
 
-    async def pipe(self, body: dict, __user__: dict, __event_emitter__=None) -> str | Generator | Iterator:
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict,
+        __event_emitter__=None,
+        __task__=None,
+        __model__=None,
+    ) -> str | Generator | Iterator:
         try:
-            # Récupérer le message de l'utilisateur
-            user_message = body["messages"][-1]["content"]
-            
-            # Ajouter le prompt de pensée séquentielle
-            system_message = {
-                "role": "system",
-                "content": self.thinking_prompt
-            }
-            
-            # Structurer le message pour le LLM
+            model = self.resolve_model(body)
+            body["model"] = model
+            system_message = get_system_message(body["messages"])
+
+            if __task__ == TASKS.TITLE_GENERATION:
+                content = await self.get_completion(model, body.get("messages"))
+                return f"{name}: {content}"
+
+            logger.debug(f"Pipe {name} received: {body}")
+
+            if system_message is None:
+                system_message = self.thinking_prompt
+            else:
+                system_message, body["messages"] = pop_system_message(body["messages"])
+                system_message = f"{self.thinking_prompt}\n\nAdditional context:\n{system_message['content']}"
+
+            body["messages"] = add_or_update_system_message(system_message, body["messages"])
+
+            last_message = body["messages"][-1]["content"]
             structured_prompt = f"""
-            Question/Task: {user_message}
+Task/Question: {last_message}
 
-            Think through this step-by-step:
+Please analyze this using the sequential thinking process:
 
-            1. Initial Understanding:
-            [Your initial analysis here]
+1. Initial Analysis:
+[Your initial understanding and breakdown]
 
-            2. Breaking Down Components:
-            [List key elements]
+2. Step-by-Step Reasoning:
+[Show your detailed thought process]
 
-            3. Processing Steps:
-            [Show your reasoning]
+3. Solution Development:
+[Build and explain your solution]
 
-            4. Verification:
-            [Check your work]
+4. Verification & Conclusion:
+[Final review and answer]
+"""
+            body["messages"][-1]["content"] = structured_prompt
 
-            5. Conclusion:
-            [Final answer]
-
-            Remember to show all your work and thinking process.
-            """
-
-            # Mettre à jour les messages
-            body["messages"] = [system_message] + body["messages"][:-1] + [{
-                "role": "user",
-                "content": structured_prompt
-            }]
-
-            logger.debug(f"Processed prompt: {structured_prompt[:200]}...")
-
-            # Retourner la réponse structurée
-            return await self.generate_response(body)
+            return await openai.generate_chat_completion(body, user=__user__)
 
         except Exception as e:
             logger.error(f"Error in sequential thinking pipeline: {str(e)}")
             raise
 
-    async def generate_response(self, body: dict):
-        # Ici, vous implementeriez la logique pour générer la réponse
-        # Cela dépendrait de votre backend LLM (OpenAI, local, etc.)
-        pass
+    async def get_completion(self, model: str, messages):
+        response = await openai.generate_chat_completion(
+            {"model": model, "messages": messages, "stream": False}
+        )
+        return self.get_response_content(response)
+
+    def get_response_content(self, response):
+        try:
+            return response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError):
+            logger.error(
+                f'ResponseError: unable to extract content from "{response[:100]}"'
+            )
+            return ""
