@@ -6,60 +6,119 @@ description: A pipeline for enhancing LLM reasoning through structured sequentia
 """
 
 import logging
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Callable
 from pydantic import BaseModel, Field
 import aiohttp
 import os
-from fastapi import HTTPException
+from fastapi import HTTPException, Depends
+from starlette.requests import Request
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response
 
 import asyncio
-import threading
-import weakref
+import functools
 from contextlib import asynccontextmanager
-from threading import Lock
-from typing import Optional, ClassVar, Dict, List, Union, Any
+from typing import Optional, List, Union, Any, Callable, TypeVar, Awaitable
+
+T = TypeVar('T')
+
+def ensure_async(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+    """Decorator to ensure a coroutine is properly awaited in FastAPI context"""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs) -> T:
+        # Get the current task
+        current_task = asyncio.current_task()
+        
+        # Check if we're in a FastAPI request context
+        request = None
+        for arg in args:
+            if isinstance(arg, Request):
+                request = arg
+                break
+        if not request:
+            for arg in kwargs.values():
+                if isinstance(arg, Request):
+                    request = arg
+                    break
+        
+        # If we have a request, ensure proper pipeline instance
+        if request and hasattr(request.state, 'pipeline'):
+            pipeline = request.state.pipeline
+            # Track the task
+            if not hasattr(request.state, 'pipeline_tasks'):
+                request.state.pipeline_tasks = set()
+            request.state.pipeline_tasks.add(current_task)
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                request.state.pipeline_tasks.remove(current_task)
+        
+        # No request context, just await normally
+        return await func(*args, **kwargs)
+    return wrapper
 
 class Pipeline:
-    _instance: ClassVar[Optional['Pipeline']] = None
-    _instances: ClassVar[Dict[int, 'Pipeline']] = weakref.WeakValueDictionary()
-    _lock = Lock()
-    _session_lock = Lock()
-    
-    @classmethod
-    async def get_instance(cls):
-        """Get or create a Pipeline instance (for FastAPI dependency injection)"""
-        task_id = id(asyncio.current_task())
-        with cls._lock:
-            instance = cls._instances.get(task_id)
-            if instance is None or not instance.is_initialized:
-                instance = cls()
-                await instance.on_startup()
-                cls._instances[task_id] = instance
-            elif instance._session and instance._session.closed:
-                await instance.on_startup()
-            return instance
+    def __init__(self):
+        self.name = "Sequential Thinking Pipeline"
+        self.valves = self.Valves()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._initialized = False
+        self.logger = self._setup_logger()
+        self.thinking_prompt = """As an AI assistant, follow these steps for sequential thinking:
+1. Initial Analysis
+2. Step-by-Step Reasoning
+3. Solution Development
+4. Verification & Conclusion"""
 
     @classmethod
-    def get_sync_instance(cls):
-        """Synchronous version of get_instance for non-async contexts"""
-        thread_id = id(threading.current_thread())
-        with cls._lock:
-            instance = cls._instances.get(thread_id)
-            if instance is None or not instance.is_initialized:
-                instance = cls()
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(instance.on_startup())
-                else:
-                    loop.run_until_complete(instance.on_startup())
-                cls._instances[thread_id] = instance
-            elif instance._session and instance._session.closed:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(instance.on_startup())
-                else:
-                    loop.run_until_complete(instance.on_startup())
-            return instance
+    async def get_instance(cls, request: Request = None) -> 'Pipeline':
+        """Get Pipeline instance for FastAPI dependency injection"""
+        instance = cls()
+        if not instance._initialized:
+            await instance.on_startup()
+        if request:
+            # Store instance in request state for lifecycle management
+            request.state.pipeline = instance
+            # Ensure cleanup when request is done
+            async def cleanup():
+                await instance.on_shutdown()
+            request.add_event_handler("shutdown", cleanup)
+        return instance
+
+    @classmethod
+    def get_dependency(cls):
+        """Get FastAPI dependency"""
+        return Depends(cls.get_instance)
+
+    @classmethod
+    def get_middleware(cls) -> Callable:
+        """Get FastAPI middleware for proper async context handling"""
+        class PipelineMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+                # Create a new task-specific pipeline instance
+                pipeline = await cls.get_instance(request)
+                request.state.pipeline_task_id = id(asyncio.current_task())
+                
+                try:
+                    # Ensure we're in an async context
+                    asyncio.current_task()
+                    response = await call_next(request)
+                    return response
+                except Exception as e:
+                    # Log any errors but ensure cleanup
+                    pipeline.logger.error(f"Error in middleware: {str(e)}")
+                    raise
+                finally:
+                    try:
+                        # Always ensure proper cleanup
+                        if hasattr(request.state, 'pipeline'):
+                            await request.state.pipeline.on_shutdown()
+                            delattr(request.state, 'pipeline')
+                    except Exception as e:
+                        # Log cleanup errors but don't raise
+                        pipeline.logger.error(f"Error during cleanup: {str(e)}")
+        
+        return PipelineMiddleware
 
     @classmethod
     @asynccontextmanager
@@ -74,39 +133,13 @@ class Pipeline:
 
     def __del__(self):
         """Ensure cleanup of resources"""
-        try:
-            # Clean up session
-            if self._session:
-                try:
-                    loop = asyncio.get_running_loop()
-                    if not loop.is_closed():
-                        loop.create_task(self.on_shutdown())
-                except RuntimeError:
-                    # No running event loop
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(self.on_shutdown())
-                    finally:
-                        loop.close()
-                        asyncio.set_event_loop(None)
-            
-            # Clean up instance tracking
-            task_id = None
+        if self._session and not self._session.closed:
             try:
-                task_id = id(asyncio.current_task())
+                loop = asyncio.get_running_loop()
+                if not loop.is_closed():
+                    loop.create_task(self.on_shutdown())
             except RuntimeError:
-                thread_id = id(threading.current_thread())
-                if thread_id in self._instances:
-                    del self._instances[thread_id]
-            
-            if task_id and task_id in self._instances:
-                del self._instances[task_id]
-                
-        except Exception as e:
-            # Log but don't raise during cleanup
-            if hasattr(self, 'logger'):
-                self.logger.error(f"Error during cleanup: {str(e)}")
+                pass  # No running event loop, session will be garbage collected
 
     class Valves(BaseModel):
         max_steps: int = Field(
@@ -138,17 +171,6 @@ class Pipeline:
             description="Temperature for completions"
         )
 
-    def __init__(self):
-        self.name = "Sequential Thinking Pipeline"
-        self.valves = self.Valves()
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._initialized = False
-        self.logger = self._setup_logger()
-        self.thinking_prompt = """As an AI assistant, follow these steps for sequential thinking:
-1. Initial Analysis
-2. Step-by-Step Reasoning
-3. Solution Development
-4. Verification & Conclusion"""
         
     @property
     def is_initialized(self) -> bool:
@@ -182,18 +204,36 @@ class Pipeline:
         if self._session:
             await self._session.close()
 
-    async def pipe(self, user_message: Optional[str] = None, messages: Optional[List[Dict]] = None, body: Optional[Dict] = None, **kwargs) -> Union[str, Dict]:
+    @ensure_async
+    async def pipe(self, user_message: Optional[str] = None, messages: Optional[List[Dict]] = None, body: Optional[Dict] = None, request: Request = None, **kwargs) -> Union[str, Dict]:
         """
         Main pipeline processing method - must be used in async context
         """
-        if not self.is_initialized:
-            raise RuntimeError("Pipeline not properly initialized. Use 'async with Pipeline.create()' to create a pipeline instance.")
+        # Get current task for tracking
+        current_task = asyncio.current_task()
+        task_id = id(current_task)
+
+        try:
+            if not self.is_initialized:
+                raise RuntimeError("Pipeline not properly initialized. Use 'async with Pipeline.create()' to create a pipeline instance.")
+                
+            # Get instance from request state if available
+            if request and hasattr(request.state, 'pipeline'):
+                pipeline = request.state.pipeline
+                if pipeline._session and not pipeline._session.closed:
+                    self._session = pipeline._session
+                # Track this task
+                if not hasattr(request.state, 'pipeline_tasks'):
+                    request.state.pipeline_tasks = {task_id}
+                else:
+                    request.state.pipeline_tasks.add(task_id)
             
-        # Ensure session is available
-        with self._session_lock:
+            # Ensure session is available
             if not self._session or self._session.closed:
                 self._session = aiohttp.ClientSession()
-        try:
+                if request:
+                    request.state.pipeline = self
+
             # Handle title generation request
             if body and body.get("title", False):
                 return self.name
@@ -223,15 +263,18 @@ class Pipeline:
         except Exception as e:
             self.logger.error(f"Error in pipeline: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            # Clean up task tracking if needed
+            if request and hasattr(request.state, 'pipeline_tasks'):
+                request.state.pipeline_tasks.discard(task_id)
 
     async def _process_message(self, message: str, model: str, system_message: Optional[str] = None) -> str:
         """Process a single message through the pipeline"""
         if not message:
             return "No message provided"
 
-        with self._session_lock:
-            if not self._session:
-                self._session = aiohttp.ClientSession()
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
 
         headers = {
             "Authorization": f"Bearer {self.valves.openai_api_key}",
@@ -267,18 +310,32 @@ class Pipeline:
             self.logger.error(f"Error processing message: {str(e)}")
             raise
 
-    async def filter_inlet(self, messages: List[dict], body: Dict) -> tuple[List[dict], Dict]:
+    async def filter_inlet(self, messages: List[dict], body: Dict, request: Request = None) -> tuple[List[dict], Dict]:
         """Pre-process messages and body before pipeline execution"""
-        # Ensure session is available for subsequent operations
-        with self._session_lock:
-            if not self._session or self._session.closed:
-                self._session = aiohttp.ClientSession()
+        # Get instance from request state if available
+        if request and hasattr(request.state, 'pipeline'):
+            pipeline = request.state.pipeline
+            if pipeline._session and not pipeline._session.closed:
+                self._session = pipeline._session
+        
+        # Ensure session is available
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
+            if request:
+                request.state.pipeline = self
         return messages, body
 
-    async def filter_outlet(self, response: Any) -> Any:
+    async def filter_outlet(self, response: Any, request: Request = None) -> Any:
         """Post-process pipeline response"""
-        # Check session state after processing
-        if self._session and self._session.closed:
-            with self._session_lock:
-                self._session = aiohttp.ClientSession()
+        # Get instance from request state if available
+        if request and hasattr(request.state, 'pipeline'):
+            pipeline = request.state.pipeline
+            if pipeline._session and not pipeline._session.closed:
+                self._session = pipeline._session
+        
+        # Ensure session is available
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
+            if request:
+                request.state.pipeline = self
         return response
