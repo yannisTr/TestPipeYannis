@@ -11,6 +11,7 @@ from typing import Generator, Iterator, List, Union, Optional
 from pydantic import BaseModel, Field
 import aiohttp
 import os
+from starlette.concurrency import run_in_threadpool
 
 class Pipeline:
     class Valves(BaseModel):
@@ -93,19 +94,15 @@ Maintain this structured approach for each response, documenting your thought pr
 
     async def on_startup(self):
         self.logger.info(f"Starting {self.name}")
-        # Verify API key is set
         if not self.valves.openai_api_key:
             self.logger.warning("OpenAI API key not set!")
-        pass
 
     async def on_shutdown(self):
         self.logger.info(f"Shutting down {self.name}")
-        pass
 
     def _prepare_messages(self, user_message: str, system_message: Optional[str] = None) -> List[dict]:
         messages = []
         
-        # Add system message if provided
         if system_message:
             messages.append({"role": "system", "content": system_message})
         else:
@@ -132,7 +129,6 @@ Please analyze this using the sequential thinking process:
         return messages
 
     async def _process_with_openai(self, messages: List[dict], model: Optional[str] = None) -> str:
-        """Process messages with OpenAI API"""
         async with aiohttp.ClientSession() as session:
             headers = {
                 "Authorization": f"Bearer {self.valves.openai_api_key}",
@@ -145,76 +141,65 @@ Please analyze this using the sequential thinking process:
                 "temperature": self.valves.temperature
             }
 
-            async with session.post(
-                f"{self.valves.openai_api_base}/chat/completions",
-                headers=headers,
-                json=data
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise Exception(f"OpenAI API error: {error_text}")
-                
-                result = await response.json()
-                return result["choices"][0]["message"]["content"]
+            try:
+                async with session.post(
+                    f"{self.valves.openai_api_base}/chat/completions",
+                    headers=headers,
+                    json=data
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"OpenAI API error: {error_text}")
+                    
+                    result = await response.json()
+                    return result["choices"][0]["message"]["content"]
+            except aiohttp.ClientError as e:
+                self.logger.error(f"Network error during API call: {e}")
+                raise
+            except Exception as e:
+                self.logger.error(f"Error processing OpenAI request: {e}")
+                raise
 
-    async def pipe(
-        self,
-        user_message: str,
-        model_id: str,
-        messages: List[dict],
-        body: dict
-    ) -> Union[str, Generator, Iterator]:
-        """Main pipeline processing method"""
+    async def _handle_message(self, user_message: str, model_id: str, system_message: Optional[str] = None) -> str:
         try:
-            # Handle title generation requests
-            if body.get("title", False):
-                return self.name
-
-            # Extract system message if present
-            system_message = None
-            if messages and messages[0].get("role") == "system":
-                system_message = messages[0]["content"]
-
-            # Prepare messages with structured thinking format
-            processed_messages = self._prepare_messages(user_message, system_message)
-
-            # Process with OpenAI
-            self.logger.debug(f"Processing request with model: {model_id}")
-            response = await self._process_with_openai(processed_messages, model_id)
-
-            # Structure the response
-            if self.valves.structured_output:
-                try:
-                    # Add any additional formatting if needed
-                    return response
-                except Exception as e:
-                    self.logger.warning(f"Failed to structure output: {e}")
-                    return response
+            messages = self._prepare_messages(user_message, system_message)
+            response = await self._process_with_openai(messages, model_id)
+            
+            if not self._verify_response(response):
+                self.logger.warning("Response verification failed, attempting retry...")
+                response = await self._retry_with_clarification(messages, model_id)
             
             return response
-
         except Exception as e:
-            self.logger.error(f"Error in sequential thinking pipeline: {str(e)}")
+            self.logger.error(f"Error in message handling: {e}")
             raise
 
+    def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Union[str, Generator, Iterator]:
+        """Non-async wrapper for the pipe functionality"""
+        if body.get("title", False):
+            return self.name
+
+        async def async_pipe():
+            try:
+                system_message = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
+                response = await self._handle_message(user_message, model_id, system_message)
+                return response
+            except Exception as e:
+                self.logger.error(f"Error in pipeline: {e}")
+                raise
+
+        return run_in_threadpool(async_pipe)
+
     def _verify_response(self, response: str) -> bool:
-        """Verify that the response follows the sequential thinking structure"""
         required_sections = [
             "Initial Analysis",
             "Step-by-Step Reasoning",
             "Solution Development",
             "Verification & Conclusion"
         ]
-        
         return all(section.lower() in response.lower() for section in required_sections)
 
-    async def _retry_with_clarification(
-        self,
-        messages: List[dict],
-        model: str,
-        attempt: int = 1
-    ) -> str:
-        """Retry the request with additional clarification if needed"""
+    async def _retry_with_clarification(self, messages: List[dict], model: str, attempt: int = 1) -> str:
         if attempt > 3:
             raise Exception("Failed to get a properly structured response after 3 attempts")
 
