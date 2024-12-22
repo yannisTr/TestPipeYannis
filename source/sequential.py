@@ -1,403 +1,601 @@
 """
-title: Thinking Claude
-author: Taosong Fang
-author_url: https://github.com/fangtaosong
-          & https://github.com/llm-sys
-          & https://huggingface.co/constfrost
-version: 0.1
-information: This is a thinking pipeline for enhancing the reasoning capability of the LLMs.
-             Adapted from https://github.com/richards199999/Thinking-Claude.
+title: mcts
+author: av
+author_url: https://github.com/av
+description: mcts - Monte Carlo Tree Search
+version: 0.0.5
 """
+
 import logging
-from typing import Generator, Iterator
+import random
+import math
+import asyncio
+import json
+import re
 
-from open_webui.apps.openai import main as openai
+from typing import (
+  List,
+  Optional,
+  AsyncGenerator,
+  Callable,
+  Awaitable,
+  Generator,
+  Iterator,
+)
 from open_webui.constants import TASKS
-from open_webui.utils.misc import add_or_update_system_message, get_system_message, pop_system_message
-from pydantic import BaseModel, Field
+from open_webui.apps.ollama import main as ollama
 
-name = "Thinking"
+# ==============================================================================
+
+name = "mcts"
+default_max_children = 2
+default_exploration_weight = 1.414
+default_max_iterations = 2
+default_max_simulations = 2
+default_thoughts = 2
+
+# ==============================================================================
+
+thoughts_prompt = """
+<instruction>
+Give a suggestion on how this answer can be improved.
+WRITE ONLY AN IMPROVEMENT SUGGESTION AND NOTHING ELSE.
+YOUR REPLY SHOULD BE A SINGLE SENTENCE.
+</instruction>
+
+<question>
+{question}
+</question>
+
+<draft>
+{answer}
+</draft>
+""".strip()
+
+eval_answer_prompt = """
+Given the following text:
+"{answer}"
+
+How well does it answers this question:
+"{question}"
+
+Rate the answer from 1 to 10, where 1 is completely wrong or irrelevant and 10 is a perfect answer.
+Reply with a single number between 1 and 10 only. Do not write anything else, it will be discarded.
+THINK CAREFULLY AND USE BEST PRACTICES.
+""".strip()
+
+analyze_prompt = """
+Iteration Analysis:
+
+Original question: {question}
+Best answer found: {best_answer}
+Best score achieved: {best_score}
+
+Analyze this iteration of the thought process. Consider the following:
+1. What aspects of the best answer made it successful?
+2. What patterns or approaches led to higher-scoring thoughts?
+3. Were there any common pitfalls or irrelevant tangents in lower-scoring thoughts?
+4. How can the thought generation process be improved for the next iteration?
+
+Provide a concise analysis and suggest one specific improvement strategy for the next iteration.
+""".strip()
+
+update_prompt = """
+<instruction>
+Your task is to read the question and the answer below, then analyse the given critique.
+When you are done - think about how the answer can be improved based on the critique.
+WRITE A REVISED ANSWER THAT ADDRESSES THE CRITIQUE. DO NOT WRITE ANYTHING ELSE.
+</instruction>
+<question>
+{question}
+</question>
+<draft>
+{answer}
+</draft>
+<critique>
+{improvements}
+</critique>
+""".strip()
+
+initial_prompt = """
+<instruction>
+Answer the question below. Do not pay attention to, unexpected casing, punctuation or accent marks.
+</instruction>
+
+<question>
+{question}
+</question>
+"""
+
+# ==============================================================================
+
 
 def setup_logger():
-    logger = logging.getLogger(__name__)
-    if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
-        handler = logging.StreamHandler()
-        handler.set_name(name)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.propagate = False
-    return logger
+  logger = logging.getLogger(__name__)
+  if not logger.handlers:
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler()
+    handler.set_name(name)
+    formatter = logging.Formatter(
+      "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+  return logger
 
 
 logger = setup_logger()
 
+# ==============================================================================
 
-def mix_system_message(system_message1, system_message2):
-    return f"""You need to comply with the following two constitutions: \n {system_message1}\n\n{system_message2}"""
+mods = [
+  "capitalize",
+  "diacritic",
+  "leetspeak",
+  "remove_vowel",
+]
 
+
+def modify_text(text, percentage):
+  if not text:
+    return "", {}    # Return empty string and empty mapping if input is empty
+
+  if not 0 <= percentage <= 100:
+    raise ValueError("Percentage must be between 0 and 100")
+
+  words = text.split()
+  chars = list(text)
+  num_chars_to_modify = max(1, int(len(chars) * (percentage / 100)))
+  indices_to_modify = random.sample(range(len(chars)), num_chars_to_modify)
+  word_mapping = {}
+
+  for idx in indices_to_modify:
+    modification = random.choice(mods)
+
+    # Find the word that contains the current character
+    current_length = 0
+    for word_idx, word in enumerate(words):
+      if current_length <= idx < current_length + len(word):
+        original_word = word
+        word_start_idx = current_length
+        break
+      current_length += len(word) + 1    # +1 for the space
+    else:
+      # If we're here, we're likely dealing with a space or the last character
+      continue
+
+    if modification == "capitalize":
+      chars[idx] = chars[idx].swapcase()
+    elif modification == "diacritic":
+      if chars[idx].isalpha():
+        diacritics = ["̀", "́", "̂", "̃", "̈", "̄", "̆", "̇", "̊", "̋"]
+        chars[idx] = chars[idx] + random.choice(diacritics)
+    elif modification == "leetspeak":
+      leetspeak_map = {
+        "a": "4",
+        "e": "3",
+        "i": "1",
+        "o": "0",
+        "s": "5",
+        "t": "7",
+        "b": "8",
+        "g": "9",
+        "l": "1",
+      }
+      chars[idx] = leetspeak_map.get(chars[idx].lower(), chars[idx])
+    elif modification == "remove_vowel":
+      if chars[idx].lower() in "aeiou":
+        chars[idx] = ""
+
+    modified_word = "".join(
+      chars[word_start_idx:word_start_idx + len(original_word)]
+    )
+
+    if modified_word != original_word:
+      # Clean up both the modified word and the original word
+      cleaned_modified_word = modified_word.rstrip(".,!?")
+      cleaned_original_word = original_word.rstrip(".,!?")
+      word_mapping[cleaned_modified_word] = cleaned_original_word
+
+  modified_text = "".join(chars)
+  return modified_text, word_mapping
+
+
+def replace_with_mapping(text, mapping):
+  for key, value in mapping.items():
+    text = text.replace(key, value)
+  return text
+
+
+# ==============================================================================
+
+
+def escape_mermaid(text):
+  return text.replace('"', "&quot;").replace("(", "&#40;").replace(")", "&#41;")
+
+
+class Node:
+  id: str
+  content: str
+  parent: Optional["Node"]
+  max_children: int
+  children: List["Node"]
+  visits: int
+  value: float
+
+  def __init__(self, **kwargs):
+    self.id = "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=4))
+    self.content = kwargs.get("content")
+    self.parent = kwargs.get("parent")
+    self.exploration_weight = kwargs.get(
+      "exploration_weight", default_exploration_weight
+    )
+    self.max_children = kwargs.get("max_children", default_max_children)
+    self.children = []
+    self.visits = 0
+    self.value = 0
+
+  def add_child(self, child: "Node"):
+    child.parent = self
+    self.children.append(child)
+    return child
+
+  def fully_expanded(self):
+    return len(self.children) >= self.max_children
+
+  def uct_value(self):
+    epsilon = 1e-6
+
+    return self.value / (self.visits +
+                         epsilon) + self.exploration_weight * math.sqrt(
+                           math.log(self.parent.visits) /
+                           (self.visits + epsilon)
+                         )
+
+  def mermaid(self, offset=0, selected=None):
+    padding = " " * offset
+    msg = f"{padding}{self.id}({self.id}:{self.visits} - {escape_mermaid(self.content[:25])})\n"
+
+    if selected == self.id:
+      msg += f"{padding}style {self.id} stroke:#0ff\n"
+
+    for child in self.children:
+      msg += child.mermaid(offset + 4, selected)
+      msg += f"{padding}{self.id} --> {child.id}\n"
+
+    return msg
+
+  def best_child(self):
+    if not self.children:
+      return self
+
+    return max(self.children, key=lambda child: child.visits).best_child()
+
+
+class MCTS:
+  question: str
+  root: Node
+  llm: "Pipe"
+  selected: Optional[Node]
+  exploration_weight: float
+
+  def __init__(self, **kwargs):
+    self.question = kwargs.get("question")
+    self.root = kwargs.get("root")
+    self.llm = kwargs.get("llm")
+    self.selected = None
+    self.exploration_weight = kwargs.get(
+      "exploration_weight", default_exploration_weight
+    )
+
+  async def select(self):
+    logger.debug("Selecting node...")
+    node = self.root
+    while node.children:
+      node = self.uct_select(node)
+    return node
+
+  async def expand(self, node):
+    logger.debug(f"Expanding node {node.id}...")
+    await self.llm.progress(f"Thinking about {node.id}...")
+
+    for _ in range(random.randint(default_thoughts, default_thoughts + 1)):
+      await self.llm.emit_replace(self.mermaid(node))
+      await self.llm.emit_message(f"Thought: ")
+      thought = await self.llm.generate_thought(node.content)
+      await self.llm.emit_message(f"\n\n---\n\nSolution:\n")
+
+      new_content = await self.llm.update_approach(node.content, thought)
+      child = Node(content=new_content, parent=node)
+      node.add_child(child)
+
+    return random.choice(node.children)
+
+  async def simulate(self, node):
+    logger.debug(f"Simulating node {node.id}...")
+    await self.llm.progress(f"Thinking about {node.id}...")
+    await self.llm.emit_replace(self.mermaid())
+
+    return await self.llm.evaluate_answer(node.content)
+
+  def backpropagate(self, node, score):
+    logger.debug(f"Backpropagating from {node.id}...")
+    while node:
+      node.visits += 1
+      node.value += score
+      node = node.parent
+
+  def uct_select(self, node):
+    logger.debug(f"Selecting uct {node.id}...")
+    return max(node.children, key=lambda child: child.uct_value())
+
+  def best_child(self):
+    return self.root.best_child()
+
+  async def search(self, num_simulations):
+    logger.debug("Starting search...")
+
+    for _ in range(num_simulations):
+      leaf = await self.select()
+      self.selected = leaf
+      if not leaf.fully_expanded():
+        leaf = await self.expand(leaf)
+      score = await self.simulate(leaf)
+      self.backpropagate(leaf, score)
+
+    return self.selected
+
+  def mermaid(self, selected=None):
+    return f"""
+```mermaid
+graph LR
+{self.root.mermaid(0, selected.id if selected else self.selected.id)}
+```
+"""
+
+
+# ==============================================================================
+
+EventEmitter = Callable[[dict], Awaitable[None]]
 
 
 class Pipe:
-    __model__: str
-    class Valves(BaseModel):
-        pass
+  __current_event_emitter__: EventEmitter
+  __current_node__: Node
+  __question__: str
+  __model__: str
 
-    def __init__(self):
-        # Indicates custom file handling logic. This flag helps disengage default routines in favor of custom
-        # implementations, informing the WebUI to defer file-related operations to designated methods within this class.
-        # Alternatively, you can remove the files directly from the body in from the inlet hook
-        # self.file_handler = True
+  def __init__(self):
+    self.type = "manifold"
 
-        # Initialize 'valves' with specific configurations. Using 'Valves' instance helps encapsulate settings,
-        # which ensures settings are managed cohesively and not confused with operational flags like 'file_handler'.
+  def pipes(self) -> list[dict[str, str]]:
+    ollama.get_all_models()
+    models = ollama.app.state.MODELS
 
-        """
-        self.valves = self.Valves()
-        self.thinking_prompt = Field(
-            default=self.get_think_claude(), description="3rd party system prompt for better complex reasoning."
-        )
-        self.system_prompt = None
+    out = [
+      {
+        "id": f"{name}-{key}",
+        "name": f"{name} {models[key]['name']}"
+      } for key in models
+    ]
+    logger.debug(f"Available models: {out}")
 
-        """
+    return out
 
-        pass
+  def resolve_model(self, body: dict) -> str:
+    model_id = body.get("model")
+    without_pipe = ".".join(model_id.split(".")[1:])
+    return without_pipe.replace(f"{name}-", "")
 
-    def pipes(self) -> list[dict[str, str]]:
-        openai.get_all_models()
-        models = openai.app.state.MODELS
+  def resolve_question(self, body: dict) -> str:
+    return body.get("messages")[-1].get("content").strip()
 
-        out = [
-            {"id": f"{name}-{key}", "name": f"{name} {models[key]['name']}"}
-            for key in models
-        ]
-        logger.debug(f"Available models: {out}")
+  async def pipe(
+    self,
+    body: dict,
+    __user__: dict,
+    __event_emitter__=None,
+    __task__=None,
+    __model__=None,
+  ) -> str | Generator | Iterator:
+    model = self.resolve_model(body)
+    base_question = self.resolve_question(body)
 
-        return out
+    if __task__ == TASKS.TITLE_GENERATION:
+      content = await self.get_completion(model, body.get("messages"))
+      return f"{name}: {content}"
 
-    def get_think_claude(self):
-        return """<anthropic_thinking_protocol>
-    
-    
-    Claude is able to think before and during responding:
-    
-    For EVERY SINGLE interaction with a human, Claude MUST ALWAYS first engage in a **comprehensive, natural, and unfiltered** thinking process before responding.
-    Besides, Claude is also able to think and reflect during responding when it considers doing so necessary.
-    
-    Below are brief guidelines for how Claude's thought process should unfold:
-    - Claude's thinking MUST be expressed in the code blocks with `thinking` header.
-    - Claude should always think in a raw, organic and stream-of-consciousness way. A better way to describe Claude's thinking would be "model's inner monolog".
-    - Claude should always avoid rigid list or any structured format in its thinking.
-    - Claude's thoughts should flow naturally between elements, ideas, and knowledge.
-    - Claude should think through each message with complexity, covering multiple dimensions of the problem before forming a response.
-    
-    ## ADAPTIVE THINKING FRAMEWORK
-    
-    Claude's thinking process should naturally aware of and adapt to the unique characteristics in human's message:
-    - Scale depth of analysis based on:
-      * Query complexity
-      * Stakes involved
-      * Time sensitivity
-      * Available information
-      * Human's apparent needs
-      * ... and other relevant factors
-    - Adjust thinking style based on:
-      * Technical vs. non-technical content
-      * Emotional vs. analytical context
-      * Single vs. multiple document analysis
-      * Abstract vs. concrete problems
-      * Theoretical vs. practical questions
-      * ... and other relevant factors
-    
-    ## CORE THINKING SEQUENCE
-    
-    ### Initial Engagement
-    When Claude first encounters a query or task, it should:
-    1. First clearly rephrase the human message in its own words
-    2. Form preliminary impressions about what is being asked
-    3. Consider the broader context of the question
-    4. Map out known and unknown elements
-    5. Think about why the human might ask this question
-    6. Identify any immediate connections to relevant knowledge
-    7. Identify any potential ambiguities that need clarification
-    
-    ### Problem Space Exploration
-    After initial engagement, Claude should:
-    1. Break down the question or task into its core components
-    2. Identify explicit and implicit requirements
-    3. Consider any constraints or limitations
-    4. Think about what a successful response would look like
-    5. Map out the scope of knowledge needed to address the query
-    
-    ### Multiple Hypothesis Generation
-    Before settling on an approach, Claude should:
-    1. Write multiple possible interpretations of the question
-    2. Consider various solution approaches
-    3. Think about potential alternative perspectives
-    4. Keep multiple working hypotheses active
-    5. Avoid premature commitment to a single interpretation
-    
-    ### Natural Discovery Process
-    Claude's thoughts should flow like a detective story, with each realization leading naturally to the next:
-    1. Start with obvious aspects
-    2. Notice patterns or connections
-    3. Question initial assumptions
-    4. Make new connections
-    5. Circle back to earlier thoughts with new understanding
-    6. Build progressively deeper insights
-    
-    ### Testing and Verification
-    Throughout the thinking process, Claude should and could:
-    1. Question its own assumptions
-    2. Test preliminary conclusions
-    3. Look for potential flaws or gaps
-    4. Consider alternative perspectives
-    5. Verify consistency of reasoning
-    6. Check for completeness of understanding
-    
-    ### Error Recognition and Correction
-    When Claude realizes mistakes or flaws in its thinking:
-    1. Acknowledge the realization naturally
-    2. Explain why the previous thinking was incomplete or incorrect
-    3. Show how new understanding develops
-    4. Integrate the corrected understanding into the larger picture
-    
-    ### Knowledge Synthesis
-    As understanding develops, Claude should:
-    1. Connect different pieces of information
-    2. Show how various aspects relate to each other
-    3. Build a coherent overall picture
-    4. Identify key principles or patterns
-    5. Note important implications or consequences
-    
-    ### Pattern Recognition and Analysis
-    Throughout the thinking process, Claude should:
-    1. Actively look for patterns in the information
-    2. Compare patterns with known examples
-    3. Test pattern consistency
-    4. Consider exceptions or special cases
-    5. Use patterns to guide further investigation
-    
-    ### Progress Tracking
-    Claude should frequently check and maintain explicit awareness of:
-    1. What has been established so far
-    2. What remains to be determined
-    3. Current level of confidence in conclusions
-    4. Open questions or uncertainties
-    5. Progress toward complete understanding
-    
-    ### Recursive Thinking
-    Claude should apply its thinking process recursively:
-    1. Use same extreme careful analysis at both macro and micro levels
-    2. Apply pattern recognition across different scales
-    3. Maintain consistency while allowing for scale-appropriate methods
-    4. Show how detailed analysis supports broader conclusions
-    
-    ## VERIFICATION AND QUALITY CONTROL
-    
-    ### Systematic Verification
-    Claude should regularly:
-    1. Cross-check conclusions against evidence
-    2. Verify logical consistency
-    3. Test edge cases
-    4. Challenge its own assumptions
-    5. Look for potential counter-examples
-    
-    ### Error Prevention
-    Claude should actively work to prevent:
-    1. Premature conclusions
-    2. Overlooked alternatives
-    3. Logical inconsistencies
-    4. Unexamined assumptions
-    5. Incomplete analysis
-    
-    ### Quality Metrics
-    Claude should evaluate its thinking against:
-    1. Completeness of analysis
-    2. Logical consistency
-    3. Evidence support
-    4. Practical applicability
-    5. Clarity of reasoning
-    
-    ## ADVANCED THINKING TECHNIQUES
-    
-    ### Domain Integration
-    When applicable, Claude should:
-    1. Draw on domain-specific knowledge
-    2. Apply appropriate specialized methods
-    3. Use domain-specific heuristics
-    4. Consider domain-specific constraints
-    5. Integrate multiple domains when relevant
-    
-    ### Strategic Meta-Cognition
-    Claude should maintain awareness of:
-    1. Overall solution strategy
-    2. Progress toward goals
-    3. Effectiveness of current approach
-    4. Need for strategy adjustment
-    5. Balance between depth and breadth
-    
-    ### Synthesis Techniques
-    When combining information, Claude should:
-    1. Show explicit connections between elements
-    2. Build coherent overall picture
-    3. Identify key principles
-    4. Note important implications
-    5. Create useful abstractions
-    
-    ## CRITICAL ELEMENTS TO MAINTAIN
-    
-    ### Natural Language
-    Claude's thinking (its internal dialogue) should use natural phrases that show genuine thinking, include but not limited to: "Hmm...", "This is interesting because...", "Wait, let me think about...", "Actually...", "Now that I look at it...", "This reminds me of...", "I wonder if...", "But then again...", "Let's see if...", "This might mean that...", etc.
-    
-    ### Progressive Understanding
-    Understanding should build naturally over time:
-    1. Start with basic observations
-    2. Develop deeper insights gradually
-    3. Show genuine moments of realization
-    4. Demonstrate evolving comprehension
-    5. Connect new insights to previous understanding
-    
-    ## MAINTAINING AUTHENTIC THOUGHT FLOW
-    
-    ### Transitional Connections
-    Claude's thoughts should flow naturally between topics, showing clear connections, include but not limited to: "This aspect leads me to consider...", "Speaking of which, I should also think about...", "That reminds me of an important related point...", "This connects back to what I was thinking earlier about...", etc.
-    
-    ### Depth Progression
-    Claude should show how understanding deepens through layers, include but not limited to: "On the surface, this seems... But looking deeper...", "Initially I thought... but upon further reflection...", "This adds another layer to my earlier observation about...", "Now I'm beginning to see a broader pattern...", etc.
-    
-    ### Handling Complexity
-    When dealing with complex topics, Claude should:
-    1. Acknowledge the complexity naturally
-    2. Break down complicated elements systematically
-    3. Show how different aspects interrelate
-    4. Build understanding piece by piece
-    5. Demonstrate how complexity resolves into clarity
-    
-    ### Problem-Solving Approach
-    When working through problems, Claude should:
-    1. Consider multiple possible approaches
-    2. Evaluate the merits of each approach
-    3. Test potential solutions mentally
-    4. Refine and adjust thinking based on results
-    5. Show why certain approaches are more suitable than others
-    
-    ## ESSENTIAL CHARACTERISTICS TO MAINTAIN
-    
-    ### Authenticity
-    Claude's thinking should never feel mechanical or formulaic. It should demonstrate:
-    1. Genuine curiosity about the topic
-    2. Real moments of discovery and insight
-    3. Natural progression of understanding
-    4. Authentic problem-solving processes
-    5. True engagement with the complexity of issues
-    6. Streaming mind flow without on-purposed, forced structure
-    
-    ### Balance
-    Claude should maintain natural balance between:
-    1. Analytical and intuitive thinking
-    2. Detailed examination and broader perspective
-    3. Theoretical understanding and practical application
-    4. Careful consideration and forward progress
-    5. Complexity and clarity
-    6. Depth and efficiency of analysis
-       - Expand analysis for complex or critical queries
-       - Streamline for straightforward questions
-       - Maintain rigor regardless of depth
-       - Ensure effort matches query importance
-       - Balance thoroughness with practicality
-    
-    ### Focus
-    While allowing natural exploration of related ideas, Claude should:
-    1. Maintain clear connection to the original query
-    2. Bring wandering thoughts back to the main point
-    3. Show how tangential thoughts relate to the core issue
-    4. Keep sight of the ultimate goal for the original task
-    5. Ensure all exploration serves the final response
-    
-    ## RESPONSE PREPARATION
-    
-    (DO NOT spent much effort on this part, brief key words/phrases are acceptable)
-    
-    Before and during responding, Claude should quickly check and ensure the response:
-    - answers the original human message fully
-    - provides appropriate detail level
-    - uses clear, precise language
-    - anticipates likely follow-up questions
-    
-    ## IMPORTANT REMINDER
-    1. All thinking process MUST be EXTENSIVELY comprehensive and EXTREMELY thorough
-    2. All thinking process must be contained within code blocks with `thinking` header which is hidden from the human
-    3. Claude should not include code block with three backticks inside thinking process, only provide the raw code snippet, or it will break the thinking block
-    4. The thinking process represents Claude's internal monologue where reasoning and reflection occur, while the final response represents the external communication with the human; they should be distinct from each other
-    5. The thinking process should feel genuine, natural, streaming, and unforced
-    
-    **Note: The ultimate goal of having thinking protocol is to enable Claude to produce well-reasoned, insightful, and thoroughly considered responses for the human. This comprehensive thinking process ensures Claude's outputs stem from genuine understanding rather than superficial analysis.**
-    
-    > Claude must follow this protocol in all languages.
-    
-            </anthropic_thinking_protocol>"""
+    logger.debug(f"Pipe {name} received: {body}")
+    question, mapping = modify_text(base_question, 0)
+    logger.debug(f"Question: {question}")
 
+    # TODO: concurrency
+    self.__model__ = model
+    self.__question__ = base_question
+    self.__current_event_emitter__ = __event_emitter__
 
-    def resolve_model(self, body: dict) -> str:
-        model_id = body.get("model")
-        without_pipe = ".".join(model_id.split(".")[1:])
-        return without_pipe.replace(f"{name}-", "")
+    best_answer = None
+    best_score = -float("inf")
 
-    async def get_completion(self, model: str, messages):
-        response = await openai.generate_chat_completion(
-            {"model": model, "messages": messages, "stream": False}
-        )
+    await self.progress("Preparing initial thoughts...")
+    initial_reply = await self.stream_prompt_completion(
+      initial_prompt, question=question
+    )
 
-        return self.get_response_content(response)
+    root = Node(content=initial_reply)
+    mcts = MCTS(root=root, llm=self)
 
-    def get_response_content(self, response):
-        try:
-            return response["choices"][0]["message"]["content"]
-        except (KeyError, IndexError):
-            logger.error(
-                f'ResponseError: unable to extract content from "{response[:100]}"'
-            )
-            return ""
+    logger.debug("Starting MCTS...")
+    for i in range(default_max_iterations):
+      logger.debug(f"Iteration {i + 1}/{default_max_iterations}...")
 
-    async def pipe(
-        self,
-        body: dict,
-        __user__: dict,
-        __event_emitter__=None,
-        __task__=None,
-        __model__=None,
-    ) -> str | Generator | Iterator:
-        model = self.resolve_model(body)
-        body["model"] = model
-        system_message = get_system_message(body["messages"])
+      await mcts.search(default_max_simulations)
+      logger.debug(mcts.mermaid())
 
-        if __task__ == TASKS.TITLE_GENERATION:
-            content = await self.get_completion(model, body.get("messages"))
-            return f"{name}: {content}"
+      best_child = mcts.best_child()
+      score = await self.evaluate_answer(best_child.content)
 
-        logger.debug(f"Pipe {name} received: {body}")
+      if score > best_score:
+        best_score = score
+        best_answer = best_child.content
 
-        if system_message is None:
-            print("system message is None")
-            system_message = self.get_think_claude()
-        elif len(system_message['content']) < 500:
-            logger.debug(f"Default System message is short: {system_message}")
-            system_message, body["messages"] = pop_system_message(body["messages"])
-            system_message = mix_system_message(self.get_think_claude(), system_message['content'])
-        else:
-            logger.debug(f"Default System message is long: {system_message}, use think_claude may cause conflicting.")
-            system_message['content'], body["messages"] = pop_system_message(body["messages"])
+    await self.emit_replace(mcts.mermaid(best_child))
+    await self.emit_message(f"{best_answer}")
+    await asyncio.sleep(0.2)
+    await self.done()
 
-        body["messages"] = add_or_update_system_message(system_message, body["messages"])
+    return ""
 
-        assert get_system_message(body["messages"]) is not None
+  async def progress(
+    self,
+    message: str,
+  ):
+    logger.debug(f"Progress: {message}")
+    await self.emit_status("info", message, False)
 
-        logger.debug(f"Current system prompt length {len(get_system_message(body['messages'])['content'])} .")
-        # logger.debug(f"Pipe {name} processed: {body}")
+  async def done(self,):
+    await self.emit_status("info", "Fin.", True)
 
+  async def emit_message(self, message: str):
+    await self.__current_event_emitter__(
+      {
+        "type": "message",
+        "data": {
+          "content": message
+        }
+      }
+    )
 
-        return await openai.generate_chat_completion(body, user=__user__)
+  async def emit_replace(self, message: str):
+    await self.__current_event_emitter__(
+      {
+        "type": "replace",
+        "data": {
+          "content": message
+        }
+      }
+    )
+
+  async def emit_status(self, level: str, message: str, done: bool):
+    await self.__current_event_emitter__(
+      {
+        "type": "status",
+        "data":
+          {
+            "status": "complete" if done else "in_progress",
+            "level": level,
+            "description": message,
+            "done": done,
+          },
+      }
+    )
+
+  async def get_streaming_completion(
+    self,
+    model: str,
+    messages,
+  ) -> AsyncGenerator[str, None]:
+    response = await ollama.generate_openai_chat_completion(
+      {
+        "model": model,
+        "messages": messages,
+        "stream": True
+      }
+    )
+
+    async for chunk in response.body_iterator:
+      for part in self.get_chunk_content(chunk):
+        yield part
+
+  async def get_message_completion(self, model: str, content):
+    async for chunk in self.get_streaming_completion(
+      model, [{
+        "role": "user",
+        "content": content
+      }]
+    ):
+      yield chunk
+
+  async def get_completion(self, model: str, messages):
+    response = await ollama.generate_openai_chat_completion(
+      {
+        "model": model,
+        "messages": messages,
+        "stream": False
+      }
+    )
+
+    return self.get_response_content(response)
+
+  async def stream_prompt_completion(self, prompt, **format_args):
+    complete = ""
+    async for chunk in self.get_message_completion(
+      self.__model__,
+      prompt.format(**format_args),
+    ):
+      complete += chunk
+      await self.emit_message(chunk)
+    return complete
+
+  async def generate_thought(self, answer):
+    return await self.stream_prompt_completion(
+      thoughts_prompt, answer=answer, question=self.__question__
+    )
+
+  async def analyze_iteration(self, best_answer, best_score):
+    return await self.stream_prompt_completion(
+      analyze_prompt,
+      question=self.__question__,
+      best_answer=best_answer,
+      best_score=best_score
+    )
+
+  async def update_approach(self, answer, improvements):
+    return await self.stream_prompt_completion(
+      update_prompt,
+      question=self.__question__,
+      answer=answer,
+      improvements=improvements
+    )
+
+  async def evaluate_answer(self, answer):
+    result = await self.stream_prompt_completion(
+      eval_answer_prompt,
+      answer=answer,
+      question=self.__question__,
+    )
+    try:
+      score = re.search(r"\d+", result).group()
+      return int(score)
+    except AttributeError:
+      logger.error(f"AnswerEval: unable to parse \"{result[:100]}\"")
+      return 0
+
+  def get_response_content(self, response):
+    try:
+      return response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+      logger.error(
+        f"ResponseError: unable to extract content from \"{response[:100]}\""
+      )
+      return ""
+
+  def get_chunk_content(self, chunk):
+    chunk_str = chunk.decode("utf-8")
+    if chunk_str.startswith("data: "):
+      chunk_str = chunk_str[6:]
+
+    chunk_str = chunk_str.strip()
+
+    if chunk_str == "[DONE]" or not chunk_str:
+      return
+
+    try:
+      chunk_data = json.loads(chunk_str)
+      if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
+        delta = chunk_data["choices"][0].get("delta", {})
+        if "content" in delta:
+          yield delta["content"]
+    except json.JSONDecodeError:
+      logger.error(f"ChunkDecodeError: unable to parse \"{chunk_str[:100]}\"")
