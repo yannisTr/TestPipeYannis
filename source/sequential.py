@@ -2,17 +2,10 @@
 Title: Sequential Thinking Pipeline
 Author: Assistant
 Date: 2024-12-22
-Version: 1.2
+Version: 1.3
 License: MIT
-Description:
-    A pipeline that combines structured thinking with step-by-step reasoning.
-    Uses both chain-of-thought prompting and dynamic step generation.
-Requirements: 
-    - pydantic>=2.0.0
-    - open_webui>=0.1.0
-    - python-logging>=0.4.9.6
-    - typing-extensions>=4.5.0
-    - python-json>=3.2
+Description: A pipeline that combines structured thinking with step-by-step reasoning.
+Requirements: pydantic>=2.0.0, open_webui>=0.1.0
 """
 
 import logging
@@ -23,29 +16,6 @@ import json
 from open_webui.apps.openai import main as openai
 from open_webui.constants import TASKS
 from open_webui.utils.misc import add_or_update_system_message, get_system_message
-
-__all__ = ['Pipeline']
-
-# Modèles de données
-class Step(BaseModel):
-    title: str = Field(..., description="Titre de l'étape")
-    description: str = Field(..., description="Description détaillée")
-    reasoning: Optional[str] = None
-    result: Optional[str] = None
-
-class ThinkingProcess(BaseModel):
-    steps: List[Step] = Field(default_factory=list)
-    conclusion: Optional[str] = None
-
-# Configuration du logging
-logger = logging.getLogger("sequential")
-if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.propagate = False
 
 class Pipeline:
     """Pipeline principale pour le raisonnement séquentiel"""
@@ -61,10 +31,16 @@ class Pipeline:
 
     def __init__(self):
         self.name = "sequential-thinking"
+        self.logger = logging.getLogger(self.name)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
         self.valves = self.Valves()
         self.file_handler = True
         
-        # Prompt de base stocké dans une chaîne brute
+        # Prompt de base
         self.thinking_prompt = r"""<thinking_protocol>
 Instructions pour le raisonnement structuré:
 1. Analyser la requête
@@ -76,6 +52,7 @@ Instructions pour le raisonnement structuré:
 
     def pipes(self) -> List[Dict[str, str]]:
         """Liste des modèles disponibles"""
+        openai.get_all_models()
         models = openai.app.state.MODELS
         return [
             {"id": "{}-{}".format(self.name, key), 
@@ -104,11 +81,11 @@ Instructions pour le raisonnement structuré:
             try:
                 return response["choices"][0]["message"]["content"]
             except (KeyError, IndexError):
-                logger.error("ResponseError: unable to extract content")
+                self.logger.error("ResponseError: unable to extract content")
                 return ""
         return response
 
-    async def create_thinking_steps(self, content: str, model: str) -> ThinkingProcess:
+    async def create_thinking_steps(self, content: str, model: str) -> Any:
         prompt = r"""Analysez la requête et créez des étapes de raisonnement. Format JSON requis:
 {
     "steps": [
@@ -124,37 +101,37 @@ Instructions pour le raisonnement structuré:
         
         try:
             steps_data = json.loads(response)
-            steps = [Step(**step_data) for step_data in steps_data["steps"]]
-            return ThinkingProcess(steps=steps)
+            return steps_data
         except Exception as e:
-            logger.error("Error parsing LLM response: " + str(e))
-            return ThinkingProcess(steps=[
-                Step(title="Analyse", description="Analyse de la requête"),
-                Step(title="Solution", description="Développement de la réponse"),
-                Step(title="Conclusion", description="Synthèse finale")
-            ])
+            self.logger.error("Error parsing LLM response: " + str(e))
+            return {
+                "steps": [
+                    {"title": "Analyse", "description": "Analyse de la requête"},
+                    {"title": "Solution", "description": "Développement de la réponse"},
+                    {"title": "Conclusion", "description": "Synthèse finale"}
+                ]
+            }
 
-    async def execute_step(self, step: Step, model: str, messages: List[dict]) -> str:
+    async def execute_step(self, step: Dict[str, str], model: str, messages: List[dict]) -> str:
         prompt = r"""Étape: {title}
 Description: {description}
 
 Analysez cette étape et fournissez:
 1. Votre raisonnement
-2. Une conclusion""".format(title=step.title, description=step.description)
+2. Une conclusion""".format(**step)
 
         messages = messages + [{"role": "user", "content": prompt}]
         return await self.get_completion(model, messages, stream=False)
 
-    async def process_thinking(self, thinking_process: ThinkingProcess, model: str, messages: List[dict]) -> str:
-        logger.info("Processing thinking steps")
+    async def process_thinking(self, thinking_steps: Dict[str, List[Dict[str, str]]], model: str, messages: List[dict]) -> str:
+        self.logger.info("Processing thinking steps")
         results = []
         
-        for step in thinking_process.steps:
+        for step in thinking_steps["steps"]:
             step_result = await self.execute_step(step, model, messages)
-            results.append("### " + step.title + "\n" + step_result)
+            results.append("### " + step["title"] + "\n" + step_result)
             messages.append({"role": "assistant", "content": step_result})
 
-        # Conclusion
         prompt = r"""Synthétisez les résultats et fournissez une conclusion finale."""
         messages.append({"role": "user", "content": prompt})
         conclusion = await self.get_completion(model, messages, stream=False)
@@ -170,7 +147,7 @@ Analysez cette étape et fournissez:
         __task__=None,
         __model__=None,
     ) -> str | Generator | Iterator:
-        logger.info("Processing request with " + self.name)
+        self.logger.info("Processing request with " + self.name)
         
         model = self.resolve_model(body)
         body["model"] = model
@@ -189,9 +166,9 @@ Analysez cette étape et fournissez:
         
         if self.valves.thinking_mode:
             content = body["messages"][-1]["content"]
-            thinking_process = await self.create_thinking_steps(content, model)
+            thinking_steps = await self.create_thinking_steps(content, model)
             return await self.process_thinking(
-                thinking_process,
+                thinking_steps,
                 model,
                 body["messages"][:-1]
             )
