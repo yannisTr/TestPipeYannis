@@ -8,6 +8,12 @@ Description:
     A pipeline that combines structured thinking with step-by-step reasoning.
     Uses both chain-of-thought prompting and dynamic step generation to break down
     complex problems into manageable steps.
+Requirements: 
+    - pydantic>=2.0.0
+    - open_webui>=0.1.0
+    - python-logging>=0.4.9.6
+    - typing-extensions>=4.5.0
+    - python-json>=3.2
 
 Features:
     - Dynamic step generation using LLM
@@ -57,18 +63,28 @@ class ThinkingProcess(BaseModel):
 class Pipe:
     """Pipeline principale pour le raisonnement séquentiel"""
     
+    __model__: str  # Requis pour la détection
+    
     class Valves(BaseModel):
-        """Configuration de la pipeline via Valves (similaire à Pipeline 1)"""
-        temperature: float = Field(default=0.7, description="Température pour la génération")
-        max_steps: int = Field(default=6, description="Nombre maximum d'étapes")
-        min_steps: int = Field(default=3, description="Nombre minimum d'étapes")
-        thinking_mode: bool = Field(default=True, description="Activer le mode thinking")
-        stream_default: bool = Field(default=True, description="Streaming par défaut")
-
+        """Configuration de la pipeline via Valves"""
+        pass  # Les valves peuvent être configurées plus tard si nécessaire
+    
     def __init__(self):
         """Initialisation de la pipeline"""
         self.name = "sequential-thinking"
         self.logger = setup_logger(self.name)
+        
+        # Paramètres de configuration
+        self.max_steps = 6
+        self.min_steps = 3
+        self.temperature = 0.7
+        self.thinking_mode = True
+        self.stream_default = True
+        
+        # Flag pour la gestion des fichiers (optionnel)
+        self.file_handler = True
+        
+        # Initialisation des valves
         self.valves = self.Valves()
         
         # Le prompt de base pour le thinking
@@ -104,23 +120,33 @@ Instructions pour le raisonnement structuré :
 </thinking_protocol>
 '''
 
+    def get_models(self) -> List[Dict[str, str]]:
+        """Récupère la liste des modèles disponibles"""
+        try:
+            openai.get_all_models()
+            models = openai.app.state.MODELS
+            
+            out = [
+                {"id": f"{self.name}-{key}", "name": f"{self.name} {models[key]['name']}"}
+                for key in models
+            ]
+            self.logger.debug(f"Available models: {out}")
+            return out
+        except Exception as e:
+            self.logger.error(f"Error getting models: {e}")
+            return []
+
     def resolve_model(self, body: dict) -> str:
         """Résout l'ID du modèle"""
-        model_id = body.get("model")
-        without_pipe = ".".join(model_id.split(".")[1:])
-        return without_pipe.replace(f"{self.name}-", "")
-
-    def pipes(self) -> List[Dict[str, str]]:
-        """Liste des modèles disponibles"""
-        openai.get_all_models()
-        models = openai.app.state.MODELS
-        
-        out = [
-            {"id": f"{self.name}-{key}", "name": f"{self.name} {models[key]['name']}"}
-            for key in models
-        ]
-        self.logger.debug(f"Available models: {out}")
-        return out
+        try:
+            model_id = body.get("model", "")
+            if "." in model_id:
+                without_pipe = ".".join(model_id.split(".")[1:])
+                return without_pipe.replace(f"{self.name}-", "")
+            return model_id
+        except Exception as e:
+            self.logger.error(f"Error resolving model: {e}")
+            return model_id
 
     async def get_completion(self, model: str, messages: List[dict], stream: bool = False) -> Any:
         """Obtient une completion du modèle (similaire à Pipeline 1)"""
