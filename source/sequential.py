@@ -8,8 +8,6 @@ Description:
     A pipeline that combines structured thinking with step-by-step reasoning.
     Uses both chain-of-thought prompting and dynamic step generation to break down
     complex problems into manageable steps.
-Requirements: pydantic, typing-extensions
- 
 
 Features:
     - Dynamic step generation using LLM
@@ -56,32 +54,57 @@ class ThinkingProcess(BaseModel):
     steps: List[Step] = Field(default_factory=list)
     conclusion: Optional[str] = Field(None)
 
-class Pipe:
+class Pipeline:
     """Pipeline principale pour le raisonnement séquentiel"""
     
-    __model__: str  # Requis pour la détection
+    __model__: str
     
     class Valves(BaseModel):
-        """Configuration de la pipeline via Valves"""
-        pass  # Les valves peuvent être configurées plus tard si nécessaire
-    
+        """Configuration de la pipeline"""
+        temperature: float = Field(default=0.7, description="Température pour la génération")
+        max_steps: int = Field(default=6, description="Nombre maximum d'étapes")
+        min_steps: int = Field(default=3, description="Nombre minimum d'étapes")
+        thinking_mode: bool = Field(default=True, description="Activer le mode thinking")
+        stream_default: bool = Field(default=True, description="Streaming par défaut")
+        thinking_prompt: str = Field(
+            default='''<thinking_protocol>
+Instructions pour le raisonnement structuré:
+
+1. Analyser la requête
+- Comprendre le contexte et les besoins
+- Identifier les contraintes et objectifs
+
+2. Générer les étapes appropriées
+- Adapter le nombre d'étapes à la complexité
+- Assurer une progression logique
+- Garder chaque étape focalisée
+
+3. Raisonner méthodiquement
+- Analyser chaque étape en détail
+- Justifier les décisions
+- Maintenir la cohérence
+
+4. Format des étapes
+- Titre clair et concis
+- Description détaillée des objectifs
+- Raisonnement explicite
+- Résultats vérifiables
+
+5. Guidelines
+- Rester factuel et précis
+- Éviter les suppositions
+- Être exhaustif dans l'analyse
+- Adapter la profondeur à la complexité
+</thinking_protocol>''',
+            description="Prompt de base pour le thinking"
+        )
+
     def __init__(self):
         """Initialisation de la pipeline"""
         self.name = "sequential-thinking"
         self.logger = setup_logger(self.name)
-        
-        # Paramètres de configuration
-        self.max_steps = 6
-        self.min_steps = 3
-        self.temperature = 0.7
-        self.thinking_mode = True
-        self.stream_default = True
-        
-        # Flag pour la gestion des fichiers (optionnel)
-        self.file_handler = True
-        
-        # Initialisation des valves
         self.valves = self.Valves()
+        self.file_handler = True  # Pour la gestion des fichiers
         
         # Le prompt de base pour le thinking
         self.thinking_prompt = '''
@@ -116,21 +139,17 @@ Instructions pour le raisonnement structuré :
 </thinking_protocol>
 '''
 
-    def get_models(self) -> List[Dict[str, str]]:
-        """Récupère la liste des modèles disponibles"""
-        try:
-            openai.get_all_models()
-            models = openai.app.state.MODELS
-            
-            out = [
-                {"id": f"{self.name}-{key}", "name": f"{self.name} {models[key]['name']}"}
-                for key in models
-            ]
-            self.logger.debug(f"Available models: {out}")
-            return out
-        except Exception as e:
-            self.logger.error(f"Error getting models: {e}")
-            return []
+    def pipes(self) -> list[dict[str, str]]:
+        """Liste des modèles disponibles - REQUIS pour la détection des pipelines"""
+        openai.get_all_models()
+        models = openai.app.state.MODELS
+
+        out = [
+            {"id": f"{self.name}-{key}", "name": f"{self.name} {models[key]['name']}"}
+            for key in models
+        ]
+        self.logger.debug(f"Available models: {out}")
+        return out
 
     def resolve_model(self, body: dict) -> str:
         """Résout l'ID du modèle"""
