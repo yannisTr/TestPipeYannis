@@ -2,7 +2,7 @@
 Title: Sequential Thinking Pipeline
 Author: Assistant
 Date: 2024-12-22
-Version: 1.4
+Version: 1.5
 License: MIT
 Description:
     A pipeline that combines structured thinking with step-by-step reasoning.
@@ -33,19 +33,13 @@ class Step(BaseModel):
     """Représente une étape de raisonnement"""
     title: str = Field(..., description="Titre de l'étape")
     description: str = Field(..., description="Description détaillée")
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
+    model_config = ConfigDict(extra='forbid')
 
 class ThinkingProcess(BaseModel):
     """Représente le processus de pensée"""
     steps: List[Step] = Field(default_factory=list)
     conclusion: Optional[str] = None
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
+    model_config = ConfigDict(extra='forbid')
 
 class Pipeline:
     """Pipeline pour le raisonnement séquentiel"""
@@ -58,10 +52,7 @@ class Pipeline:
         max_steps: int = Field(default=6)
         min_steps: int = Field(default=3)
         thinking_mode: bool = Field(default=True)
-
-        model_config = ConfigDict(
-            extra='forbid',
-        )
+        model_config = ConfigDict(extra='forbid')
 
     def __init__(self):
         """Initialisation de la pipeline"""
@@ -79,27 +70,7 @@ Instructions pour le raisonnement structuré:
 
     async def on_startup(self):
         """Initialisation du client OpenAI"""
-        self.client = OpenAI(
-            api_key=self.valves.OPENAI_API_KEY,
-        )
-
-    async def on_shutdown(self):
-        """Nettoyage lors de l'arrêt"""
-        pass
-
-    def get_models(self) -> List[Dict[str, str]]:
-        """Liste des modèles disponibles"""
-        return [
-            {"id": f"{self.name}-gpt4", "name": f"{self.name} GPT-4 Turbo"},
-            {"id": f"{self.name}-gpt3", "name": f"{self.name} GPT-3.5 Turbo"}
-        ]
-
-    def resolve_model(self, body: dict) -> str:
-        """Résout l'ID du modèle"""
-        model_id = body.get("model", "")
-        if "-gpt4" in model_id:
-            return "gpt-4-turbo-preview"
-        return "gpt-3.5-turbo"
+        self.client = OpenAI(api_key=self.valves.OPENAI_API_KEY)
 
     async def create_thinking_steps(self, content: str, model: str) -> ThinkingProcess:
         """Génère les étapes de réflexion"""
@@ -114,7 +85,13 @@ Instructions pour le raisonnement structuré:
 }"""
         response = await self.client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt + "\n\nRequête:\n" + content}],
+            messages=[{
+                "role": "system",
+                "content": self.thinking_prompt
+            }, {
+                "role": "user",
+                "content": prompt + "\n\nRequête:\n" + content
+            }],
             temperature=self.valves.temperature
         )
         
@@ -129,7 +106,7 @@ Instructions pour le raisonnement structuré:
                 Step(title="Conclusion", description="Synthèse finale")
             ])
 
-    async def execute_step(self, step: Step, model: str, messages: List[dict]) -> str:
+    async def execute_step(self, step: Step, messages: List[dict], model: str) -> str:
         """Exécute une étape de réflexion"""
         prompt = r"""Étape: {title}
 Description: {description}
@@ -145,17 +122,18 @@ Analysez cette étape et fournissez:
         )
         return response.choices[0].message.content
 
-    async def process_thinking(self, thinking_process: ThinkingProcess, model: str, messages: List[dict]) -> str:
+    async def process_thinking(self, messages: List[dict], model: str) -> str:
         """Traite le processus de réflexion"""
         logger.info("Processing thinking steps")
+        content = messages[-1]["content"]
+        thinking_process = await self.create_thinking_steps(content, model)
         results = []
         
         for step in thinking_process.steps:
-            step_result = await self.execute_step(step, model, messages)
+            step_result = await self.execute_step(step, messages[:-1], model)
             results.append(f"### {step.title}\n{step_result}")
             messages.append({"role": "assistant", "content": step_result})
 
-        # Conclusion
         prompt = r"""Synthétisez les résultats et fournissez une conclusion finale."""
         response = await self.client.chat.completions.create(
             model=model,
@@ -166,28 +144,18 @@ Analysez cette étape et fournissez:
         
         return "\n\n".join(results + ["\n### Conclusion", conclusion])
 
-    async def pipe(
-        self,
-        body: dict,
-        messages: List[dict],
-    ) -> str:
-        """Point d'entrée principal"""
+    async def pipe(self, messages: List[dict], model: Optional[str] = None) -> str:
+        """Point d'entrée principal de la pipeline"""
         logger.info(f"Processing request with {self.name}")
         
-        model = self.resolve_model(body)
+        if not self.client:
+            await self.on_startup()
+        
+        model = model or self.valves.MODEL_NAME
         messages = messages.copy()
 
-        # Ajout du prompt de thinking
-        messages.insert(0, {"role": "system", "content": self.thinking_prompt})
-        
         if self.valves.thinking_mode:
-            content = messages[-1]["content"]
-            thinking_process = await self.create_thinking_steps(content, model)
-            return await self.process_thinking(
-                thinking_process,
-                model,
-                messages[:-1]
-            )
+            return await self.process_thinking(messages, model)
         else:
             response = await self.client.chat.completions.create(
                 model=model,
