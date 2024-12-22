@@ -385,8 +385,7 @@ graph LR
 EventEmitter = Callable[[dict], Awaitable[None]]
 
 
-class Pipe:
-  __current_event_emitter__: EventEmitter
+class Pipe(Pipeline):
   __current_event_emitter__: EventEmitter
   __current_node__: Node
   __question__: str
