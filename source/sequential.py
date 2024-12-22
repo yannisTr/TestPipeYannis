@@ -72,6 +72,19 @@ Instructions pour le raisonnement structuré:
         """Initialisation du client OpenAI"""
         self.client = OpenAI(api_key=self.valves.OPENAI_API_KEY)
 
+    def pipes(self) -> List[Dict[str, str]]:
+        """Liste des modèles disponibles"""
+        return [
+            {"id": f"{self.name}-gpt4", "name": f"{self.name} GPT-4 Turbo"},
+            {"id": f"{self.name}-gpt3", "name": f"{self.name} GPT-3.5 Turbo"}
+        ]
+
+    def resolve_model(self, model_id: str = "") -> str:
+        """Résout l'ID du modèle"""
+        if "-gpt4" in model_id:
+            return "gpt-4-turbo-preview"
+        return "gpt-3.5-turbo"
+
     async def create_thinking_steps(self, content: str, model: str) -> ThinkingProcess:
         """Génère les étapes de réflexion"""
         prompt = r"""Analysez la requête et créez des étapes de raisonnement. Format JSON:
@@ -144,15 +157,26 @@ Analysez cette étape et fournissez:
         
         return "\n\n".join(results + ["\n### Conclusion", conclusion])
 
-    async def pipe(self, messages: List[dict], model: Optional[str] = None) -> str:
+    async def pipe(
+        self,
+        user_message: str = "",
+        body: dict = None,
+        messages: List[dict] = None,
+        model: Optional[str] = None,
+        **kwargs
+    ) -> str:
         """Point d'entrée principal de la pipeline"""
         logger.info(f"Processing request with {self.name}")
         
         if not self.client:
             await self.on_startup()
-        
+
         model = model or self.valves.MODEL_NAME
-        messages = messages.copy()
+        if messages is None:
+            messages = []
+            
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
 
         if self.valves.thinking_mode:
             return await self.process_thinking(messages, model)
