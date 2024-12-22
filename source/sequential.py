@@ -12,6 +12,7 @@ import math
 import asyncio
 import json
 import re
+import os
 
 from typing import (
   List,
@@ -24,7 +25,31 @@ from typing import (
 )
 from open_webui.constants import TASKS
 from open_webui.apps.ollama import main as ollama
+from pydantic import BaseModel
+from typing import List, Optional
 
+class Pipeline:
+    class Valves(BaseModel):
+        max_children: int = default_max_children
+        exploration_weight: float = default_exploration_weight
+        max_iterations: int = default_max_iterations
+        max_simulations: int = default_max_simulations
+        thoughts: int = default_thoughts
+        model_name: str = "llama2"
+        base_url: str = "http://localhost:11434"
+    
+    def __init__(self):
+        self.valves = self.Valves(
+            **{
+                "max_children": int(os.getenv("MCTS_MAX_CHILDREN", default_max_children)),
+                "exploration_weight": float(os.getenv("MCTS_EXPLORATION_WEIGHT", default_exploration_weight)),
+                "max_iterations": int(os.getenv("MCTS_MAX_ITERATIONS", default_max_iterations)),
+                "max_simulations": int(os.getenv("MCTS_MAX_SIMULATIONS", default_max_simulations)),
+                "thoughts": int(os.getenv("MCTS_THOUGHTS", default_thoughts)),
+                "model_name": os.getenv("MCTS_MODEL_NAME", "llama2"),
+                "base_url": os.getenv("MCTS_BASE_URL", "http://localhost:11434")
+            }
+        )
 # ==============================================================================
 
 name = "mcts"
@@ -361,6 +386,7 @@ EventEmitter = Callable[[dict], Awaitable[None]]
 
 
 class Pipe:
+  __current_event_emitter__: EventEmitter
   __current_event_emitter__: EventEmitter
   __current_node__: Node
   __question__: str
