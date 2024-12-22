@@ -8,12 +8,8 @@ Description:
     A pipeline that combines structured thinking with step-by-step reasoning.
     Uses both chain-of-thought prompting and dynamic step generation to break down
     complex problems into manageable steps.
-Requirements: 
-    - pydantic>=2.0.0
-    - open_webui>=0.1.0
-    - python-logging>=0.4.9.6
-    - typing-extensions>=4.5.0
-    - python-json>=3.2
+Requirements: pydantic, typing-extensions
+ 
 
 Features:
     - Dynamic step generation using LLM
