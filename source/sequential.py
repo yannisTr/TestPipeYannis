@@ -9,18 +9,13 @@ Description:
     Uses both chain-of-thought prompting and dynamic step generation to break down
     complex problems into manageable steps.
 
-Features:
-    - Dynamic step generation using LLM
-    - Structured thinking process
-    - Stream support
-    - System message integration
-    - Configurable step count and parameters
 """
 
 import logging
 from typing import List, Dict, Any, Optional, Generator, Iterator
 from pydantic import BaseModel, Field
 from datetime import datetime
+import json
 
 from open_webui.apps.openai import main as openai
 from open_webui.constants import TASKS
@@ -33,9 +28,7 @@ def setup_logger(name: str) -> logging.Logger:
         logger.setLevel(logging.DEBUG)
         handler = logging.StreamHandler()
         handler.set_name(name)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
         logger.propagate = False
@@ -67,7 +60,7 @@ class Pipeline:
         thinking_mode: bool = Field(default=True, description="Activer le mode thinking")
         stream_default: bool = Field(default=True, description="Streaming par défaut")
         thinking_prompt: str = Field(
-            default='''<thinking_protocol>
+            default=r'''<thinking_protocol>
 Instructions pour le raisonnement structuré:
 
 1. Analyser la requête
@@ -104,67 +97,26 @@ Instructions pour le raisonnement structuré:
         self.name = "sequential-thinking"
         self.logger = setup_logger(self.name)
         self.valves = self.Valves()
-        self.file_handler = True  # Pour la gestion des fichiers
-        
-        # Le prompt de base pour le thinking
-        self.thinking_prompt = '''
-<thinking_protocol>
-Instructions pour le raisonnement structuré :
+        self.file_handler = True
 
-1. Analyser la requête
-- Comprendre le contexte et les besoins
-- Identifier les contraintes et objectifs
-
-2. Générer les étapes appropriées
-- Adapter le nombre d'étapes à la complexité
-- Assurer une progression logique
-- Garder chaque étape focalisée
-
-3. Raisonner méthodiquement
-- Analyser chaque étape en détail
-- Justifier les décisions
-- Maintenir la cohérence
-
-4. Format des étapes
-- Titre clair et concis
-- Description détaillée des objectifs
-- Raisonnement explicite
-- Résultats vérifiables
-
-5. Guidelines
-- Rester factuel et précis
-- Éviter les suppositions
-- Être exhaustif dans l'analyse
-- Adapter la profondeur à la complexité
-</thinking_protocol>
-'''
-
-    def pipes(self) -> list[dict[str, str]]:
-        """Liste des modèles disponibles - REQUIS pour la détection des pipelines"""
-        openai.get_all_models()
+    def pipes(self) -> List[Dict[str, str]]:
+        """Liste des modèles disponibles"""
         models = openai.app.state.MODELS
-
-        out = [
-            {"id": f"{self.name}-{key}", "name": f"{self.name} {models[key]['name']}"}
+        return [
+            {"id": "{}-{}".format(self.name, key), "name": "{} {}".format(self.name, models[key]['name'])}
             for key in models
         ]
-        self.logger.debug(f"Available models: {out}")
-        return out
 
     def resolve_model(self, body: dict) -> str:
         """Résout l'ID du modèle"""
-        try:
-            model_id = body.get("model", "")
-            if "." in model_id:
-                without_pipe = ".".join(model_id.split(".")[1:])
-                return without_pipe.replace(f"{self.name}-", "")
-            return model_id
-        except Exception as e:
-            self.logger.error(f"Error resolving model: {e}")
-            return model_id
+        model_id = body.get("model", "")
+        if "." in model_id:
+            without_pipe = ".".join(model_id.split(".")[1:])
+            return without_pipe.replace("{}-".format(self.name), "")
+        return model_id
 
     async def get_completion(self, model: str, messages: List[dict], stream: bool = False) -> Any:
-        """Obtient une completion du modèle (similaire à Pipeline 1)"""
+        """Obtient une completion du modèle"""
         response = await openai.generate_chat_completion(
             {
                 "model": model,
@@ -178,33 +130,69 @@ Instructions pour le raisonnement structuré :
             try:
                 return response["choices"][0]["message"]["content"]
             except (KeyError, IndexError):
-                self.logger.error(f'ResponseError: unable to extract content')
+                self.logger.error("ResponseError: unable to extract content")
                 return ""
         return response
 
+    async def evaluate_need_for_additional_steps(self, current_results: List[str], messages: List[dict], model: str) -> Optional[List[Step]]:
+        """Évalue si des étapes supplémentaires sont nécessaires"""
+        evaluation_prompt = """
+Analysez les étapes de raisonnement effectuées jusqu'à présent:
+
+{}
+
+Déterminez si des étapes supplémentaires sont nécessaires pour une réponse complète.
+Si oui, spécifiez les étapes additionnelles en format JSON comme suit:
+{{
+    "needs_additional_steps": true/false,
+    "steps": [
+        {{
+            "title": "Titre de l'étape",
+            "description": "Description détaillée"
+        }}
+    ],
+    "reasoning": "Explication de pourquoi ces étapes sont nécessaires"
+}}
+""".format("\n".join(current_results))
+
+        try:
+            response = await self.get_completion(
+                model,
+                messages + [{"role": "user", "content": evaluation_prompt}],
+                stream=False
+            )
+            evaluation = json.loads(response)
+            
+            if evaluation.get("needs_additional_steps", False):
+                self.logger.info("Additional steps needed: {}".format(evaluation.get("reasoning")))
+                return [Step(**step) for step in evaluation.get("steps", [])]
+            return None
+        except Exception as e:
+            self.logger.error("Error evaluating need for additional steps: {}".format(str(e)))
+            return None
+
     async def create_thinking_steps(self, content: str, model: str) -> ThinkingProcess:
         """Génère dynamiquement les étapes de pensée via le LLM"""
-        step_generation_prompt = f"""
-Analysez la requête suivante et créez des étapes de raisonnement appropriées :
+        step_generation_prompt = """
+Analysez la requête suivante et créez des étapes de raisonnement appropriées:
 
-{content}
+{}
 
-Générez entre {self.valves.min_steps} et {self.valves.max_steps} étapes de raisonnement pertinentes.
-Chaque étape doit avoir :
+Générez entre {} et {} étapes de raisonnement pertinentes.
+Chaque étape doit avoir:
 1. Un titre court et descriptif
 2. Une description détaillée de ce qui doit être analysé ou résolu
 
-Format JSON requis :
+Format JSON requis:
 {{
     "steps": [
         {{
             "title": "Titre de l'étape",
             "description": "Description détaillée"
-        }},
-        ...
+        }}
     ]
 }}
-"""
+""".format(content, self.valves.min_steps, self.valves.max_steps)
         
         response = await self.get_completion(
             model,
@@ -213,12 +201,11 @@ Format JSON requis :
         )
         
         try:
-            import json
             steps_data = json.loads(response)
             steps = [Step(**step_data) for step_data in steps_data["steps"]]
             return ThinkingProcess(steps=steps)
-        except (json.JSONDecodeError, KeyError) as e:
-            self.logger.error(f"Error parsing LLM response: {e}")
+        except Exception as e:
+            self.logger.error("Error parsing LLM response: {}".format(str(e)))
             fallback_steps = [
                 Step(
                     title="Analyse du problème",
@@ -237,48 +224,17 @@ Format JSON requis :
 
     async def execute_step(self, step: Step, model: str, messages: List[dict]) -> str:
         """Exécute une étape de raisonnement"""
-        step_prompt = f"""
-Étape : {step.title}
-Description : {step.description}
+        step_prompt = """
+Étape: {}
+Description: {}
 
-Analysez cette étape et fournissez :
+Analysez cette étape et fournissez:
 1. Votre raisonnement détaillé
 2. Une conclusion pour cette étape
-"""
+""".format(step.title, step.description)
+
         messages = messages + [{"role": "user", "content": step_prompt}]
         return await self.get_completion(model, messages, stream=False)
-
-    async def evaluate_need_for_additional_steps(self, current_results: List[str], messages: List[dict], model: str) -> Optional[List[Step]]:
-        """Évalue si des étapes supplémentaires sont nécessaires"""
-        evaluation_prompt = f"""
-Analysez les étapes de raisonnement effectuées jusqu'à présent :
-
-{'\n'.join(current_results)}
-
-Déterminez si des étapes supplémentaires sont nécessaires pour une réponse complète.
-Si oui, spécifiez les étapes additionnelles en format JSON comme suit :
-{
-    "needs_additional_steps": true/false,
-    "steps": [
-        {
-            "title": "Titre de l'étape",
-            "description": "Description détaillée"
-        }
-    ],
-    "reasoning": "Explication de pourquoi ces étapes sont nécessaires"
-}
-"""
-        try:
-            response = await self.get_completion(model, messages + [{"role": "user", "content": evaluation_prompt}], stream=False)
-            evaluation = json.loads(response)
-            
-            if evaluation.get("needs_additional_steps", False):
-                self.logger.info(f"Additional steps needed: {evaluation.get('reasoning')}")
-                return [Step(**step) for step in evaluation.get("steps", [])]
-            return None
-        except Exception as e:
-            self.logger.error(f"Error evaluating need for additional steps: {e}")
-            return None
 
     async def process_thinking(self, thinking_process: ThinkingProcess, model: str, messages: List[dict]) -> str:
         """Traite l'ensemble du processus de pensée avec ajout dynamique d'étapes"""
@@ -289,23 +245,20 @@ Si oui, spécifiez les étapes additionnelles en format JSON comme suit :
         processed_steps = 0
         
         while processed_steps < len(current_steps):
-            # Traitement des étapes actuelles
             while processed_steps < len(current_steps):
                 step = current_steps[processed_steps]
                 step_result = await self.execute_step(step, model, messages)
-                results.append(f"### {step.title}\n{step_result}")
+                results.append("### {}\n{}".format(step.title, step_result))
                 messages.append({"role": "assistant", "content": step_result})
                 processed_steps += 1
             
-            # Évaluation du besoin d'étapes supplémentaires
             additional_steps = await self.evaluate_need_for_additional_steps(results, messages, model)
             if additional_steps:
-                self.logger.info(f"Adding {len(additional_steps)} new steps")
+                self.logger.info("Adding {} new steps".format(len(additional_steps)))
                 current_steps.extend(additional_steps)
 
-        # Conclusion finale
         conclusion_prompt = """
-Analysez tous les résultats précédents et fournissez une conclusion finale qui :
+Analysez tous les résultats précédents et fournissez une conclusion finale qui:
 1. Synthétise les points clés de chaque étape
 2. Tire des conclusions générales
 3. Répond à la question ou problématique initiale
@@ -325,27 +278,24 @@ Analysez tous les résultats précédents et fournissez une conclusion finale qu
         __model__=None,
     ) -> str | Generator | Iterator:
         """Point d'entrée principal de la pipeline"""
-        self.logger.info(f"Processing request with {self.name}")
+        self.logger.info("Processing request with {}".format(self.name))
         
         model = self.resolve_model(body)
         body["model"] = model
         
-        # Gestion de la génération de titre
         if __task__ == TASKS.TITLE_GENERATION:
             content = await self.get_completion(model, body.get("messages"), stream=False)
-            return f"{self.name}: {content}"
+            return "{}: {}".format(self.name, content)
 
-        # Gestion du message système
         system_message = get_system_message(body["messages"])
         if system_message is None:
-            system_message = {"role": "system", "content": self.thinking_prompt}
+            system_message = {"role": "system", "content": self.valves.thinking_prompt}
         elif len(system_message["content"]) < 500:
             original_content = system_message["content"]
-            system_message["content"] = f"{self.thinking_prompt}\n\n{original_content}"
+            system_message["content"] = "{}\n\n{}".format(self.valves.thinking_prompt, original_content)
         
         body["messages"] = add_or_update_system_message(system_message, body["messages"])
         
-        # Mode thinking ou normal
         if self.valves.thinking_mode:
             content = body["messages"][-1]["content"]
             thinking_process = await self.create_thinking_steps(content, model)
@@ -356,13 +306,7 @@ Analysez tous les résultats précédents et fournissez une conclusion finale qu
             )
             return response
         else:
-            # Support du streaming si demandé
             if body.get("stream", self.valves.stream_default):
                 return await openai.generate_chat_completion(body, user=__user__)
             else:
-                response = await self.get_completion(
-                    model,
-                    body["messages"],
-                    stream=False
-                )
-                return response
+                return await self.get_completion(model, body["messages"], stream=False)
